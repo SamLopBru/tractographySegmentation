@@ -12,3 +12,6 @@ wheels/
 # Certain extensions
 *.csv
 *.hdf5
+
+# Complete folders
+preprocessing/csvs
