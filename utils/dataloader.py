@@ -1,83 +1,9 @@
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, Sampler, DataLoader
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from typing import List, Tuple, Optional, Iterator, cast, Sized
+from typing import Dict, List, Tuple, Optional, Iterator, cast
 import h5py
 import numpy as np  
-
-# Not in use
-class EpochSubsetSampler(Sampler[int]):
-    """
-    Sampler that provides a different random subset of indices each epoch.
-    
-    Call set_epoch(epoch) at the start of each epoch to get a new random subset.
-    The subset size is determined by sampling_percentage, min_samples, and max_samples.
-    """
-    
-    def __init__(
-        self,
-        dataset: Dataset,
-        sampling_percentage: float = 0.20,
-        min_samples: int = 1000,
-        max_samples: Optional[int] = None,
-        seed: int = 42,
-        shuffle: bool = True
-    ):
-        """
-        Args:
-            dataset: The dataset to sample from
-            sampling_percentage: Percentage of total streamlines to sample (0-1)
-            min_samples: Minimum number of samples per epoch
-            max_samples: Maximum number of samples per epoch (None = no limit)
-            seed: Base random seed for reproducibility
-            shuffle: Whether to shuffle the sampled indices
-        """
-        self.dataset = dataset
-        self.sampling_percentage = sampling_percentage
-        self.min_samples = min_samples
-        self.max_samples = max_samples
-        self.seed = seed
-        self.shuffle = shuffle
-        self.epoch = 0
-        
-        # Calculate number of samples per epoch
-        total_size = len(cast(Sized, dataset))
-        n_percentage = int(total_size * sampling_percentage)
-        self.n_samples = max(self.min_samples, n_percentage)
-        
-        if self.max_samples is not None:
-            self.n_samples = min(self.n_samples, self.max_samples)
-        
-        self.n_samples = min(self.n_samples, total_size)
-        
-        print(f"EpochSubsetSampler: {self.n_samples} samples per epoch "
-            f"(from {total_size} total, {self.sampling_percentage*100:.1f}%)")
-    
-    def set_epoch(self, epoch: int) -> None:
-        """
-        Set the epoch number to generate a different random subset.
-        
-        Call this at the start of each epoch before iterating.
-        """
-        self.epoch = epoch
-    
-    def __iter__(self) -> Iterator[int]:
-        """Generate a random subset of indices for this epoch."""
-        # Use epoch-dependent seed for reproducibility
-        rng = np.random.default_rng(self.seed + self.epoch)
-        
-        # Sample indices without replacement
-        total_size = len(cast(Sized, self.dataset))
-        indices = rng.choice(total_size, self.n_samples, replace=False)
-        
-        if self.shuffle:
-            rng.shuffle(indices)
-        
-        return iter(indices.tolist())
-    
-    def __len__(self) -> int:
-        return self.n_samples
-
 
 class StratifiedEpochSampler(Sampler[int]):
     """
@@ -94,72 +20,85 @@ class StratifiedEpochSampler(Sampler[int]):
         dataset: 'StreamlineDataset',
         sampling_percentage: float = 0.10,
         min_samples_per_class: int = 10,
-        full_sample_threshold: int = 1000,
         seed: int = 42,
         shuffle: bool = True,
-        verbose: bool = False
+        verbose: bool = False,
+        expected_effective_percentage: Optional[float] = None,
+        effective_percentage_tolerance: float = 1e-6
     ):
         """
         Args:
             dataset: StreamlineDataset with streamline_index containing 'tract_id'
             sampling_percentage: Percentage to sample from EACH class (0-1)
             min_samples_per_class: Minimum samples per class per epoch
-            full_sample_threshold: If class has fewer than this many indexed, take all (100%)
             seed: Base random seed for reproducibility
             shuffle: Whether to shuffle the final indices
             verbose: Whether to print additional information
+            expected_effective_percentage: Optional expected effective percentage of samples as the combination of sampling_percentage of the Sampler and the Dataset.
+            effective_percentage_tolerance: Tolerance for checking effective percentage mismatch
         """
         self.dataset = dataset
         self.sampling_percentage = sampling_percentage
         self.min_samples_per_class = min_samples_per_class
-        self.full_sample_threshold = full_sample_threshold
         self.seed = seed
         self.shuffle = shuffle
         self.epoch = 0
+
+        dataset_pct = getattr(dataset, "sampling_percentage", 1.0)
+        self.effective_percentage = dataset_pct * sampling_percentage
+        if expected_effective_percentage is not None:
+            if abs(self.effective_percentage - expected_effective_percentage) > effective_percentage_tolerance:
+                raise ValueError(
+                    f"Effective per-epoch sampling rate mismatch: dataset.sampling_percentage "
+                    f"({dataset_pct}) * sampler.sampling_percentage ({sampling_percentage}) = "
+                    f"{self.effective_percentage:.6f}, but expected_effective_percentage="
+                    f"{expected_effective_percentage}. Update one of the two percentages, or "
+                    f"update expected_effective_percentage if this change is intentional."
+                )
         
         # Build class-to-indices mapping using NumPy for efficiency
         # Works with both dict-based and NumPy structured array index
-        self.class_indices = {}
+        self.class_indices: Dict[int, np.ndarray] = {}
 
         if dataset.streamline_index is None:
                 raise ValueError("Dataset's streamline_index is None. Ensure the dataset is properly initialized.")
         
         # NumPy structured array version
         tract_ids = dataset.streamline_index['tract_id']
+        tmp_indices: Dict[int, list] = {}
         for idx in range(len(dataset)):
             tract_id = int(tract_ids[idx])
-            if tract_id not in self.class_indices:
-                self.class_indices[tract_id] = []
-            self.class_indices[tract_id].append(idx)
+            tmp_indices.setdefault(tract_id, []).append(idx)
+        # store as numpy arrays for faster rng.choice
+        self.class_indices = {tid: np.asarray(v, dtype=np.int64) for tid, v in tmp_indices.items()}
         
-        # Adaptive threshold: 5% of the largest class size
-        max_class_size = max(len(indices) for indices in self.class_indices.values())
-        adaptive_threshold = int(max_class_size * 0.05)
-        if self.full_sample_threshold is not None:
-            adaptive_threshold = min(adaptive_threshold, self.full_sample_threshold)
+        fully_sampled_tracts = getattr(dataset, "fully_sampled_tracts", set())
         
         # Calculate samples per class
         self.samples_per_class = {}
         total_samples = 0
         for tract_id, indices in self.class_indices.items():
             n_available = len(indices)
-            # If class has fewer than adaptive threshold, take all samples
-            if n_available < adaptive_threshold:
+
+            if tract_id in fully_sampled_tracts:
+                # This class was already fully retained during dataset indexing,
+                # so keep taking 100% of it every epoch too.
                 n_to_sample = n_available
             else:
                 n_percentage = int(n_available * sampling_percentage)
                 n_to_sample = max(self.min_samples_per_class, n_percentage)
                 n_to_sample = min(n_to_sample, n_available)
+
             self.samples_per_class[tract_id] = n_to_sample
             total_samples += n_to_sample
-        
+
         self.n_samples = total_samples
         
         if verbose:
             print(f"StratifiedEpochSampler: {self.n_samples} samples per epoch "
-                f"({self.sampling_percentage*100:.1f}% per class, full if < {adaptive_threshold} "
-                f"[5% of max class={max_class_size}])")
-        
+                f"({self.sampling_percentage*100:.1f}% per class; classes already fully "
+                f"retained at indexing time keep 100%: {sorted(fully_sampled_tracts)})")
+
             for tract_id in sorted(self.samples_per_class.keys()):
                 print(f"  Class {tract_id}: {self.samples_per_class[tract_id]} / {len(self.class_indices[tract_id])}")
     
@@ -207,7 +146,6 @@ class StreamlineDataset(Dataset):
     # Structured array dtype for memory-efficient index
     INDEX_DTYPE = np.dtype([
         ('file_id', np.int16),        # Index into file_paths_lookup
-        ('group_id', np.int16),       # tract_XX group number (0-31)
         ('streamline_idx', np.int32), # Index within the group
         ('length', np.int16),         # Streamline length
         ('tract_id', np.int8),        # Class label (0-31)
@@ -219,9 +157,9 @@ class StreamlineDataset(Dataset):
         sampling_percentage: float = 0.10,
         min_streamlines: int = 50,
         max_streamlines_per_tract: Optional[int] = None,
-        full_sample_threshold: int = 1000,
         seed: int = 42,
         cache_dir: Optional[str] = None,
+        verbose: bool = False
     ):
         """
         Args:
@@ -229,7 +167,6 @@ class StreamlineDataset(Dataset):
             sampling_percentage: Percentage of streamlines to index from each tract (0-1)
             min_streamlines: Minimum number of streamlines per tract
             max_streamlines_per_tract: Maximum number of streamlines per tract (None = no limit)
-            full_sample_threshold: If tract has fewer than this many streamlines, take all (100%)
             seed: Random seed for reproducibility of the initial sampling
             cache_dir: Optional directory to cache the index (for faster startup)
         """
@@ -237,9 +174,9 @@ class StreamlineDataset(Dataset):
         self.sampling_percentage = sampling_percentage
         self.min_streamlines = min_streamlines
         self.max_streamlines_per_tract = max_streamlines_per_tract
-        self.full_sample_threshold = full_sample_threshold
         self.seed = seed
         self.cache_dir = cache_dir
+        self.verbose = verbose
         
         # File path lookup table (maps file_id -> file_path)
         self.file_paths_lookup = list(hdf5_file_paths)
@@ -263,7 +200,8 @@ class StreamlineDataset(Dataset):
     
     def _build_index(self):
         """Build an index of sampled streamlines in the dataset."""
-        print(f"Building streamline index (sampling {self.sampling_percentage*100:.1f}% per tract)...")
+        if self.verbose:
+            print(f"Building streamline index (sampling {self.sampling_percentage*100:.1f}% per tract)...")
         
         rng = np.random.default_rng(self.seed)
         
@@ -277,9 +215,15 @@ class StreamlineDataset(Dataset):
                 for group_name in f.keys():
                     if not group_name.startswith('tract_'):
                         continue
-                    group_id = int(group_name.split('_')[1])
+
                     tract_group = cast(h5py.Group, f[group_name])
                     tract_id = self._read_int_attr(tract_group, 'tract_id')
+                    group_id = int(group_name.split('_')[1])
+                    assert group_id == tract_id, (
+                        f"Invariant violated: group '{group_name}' has group_id={group_id} but "
+                        f"tract_id={tract_id}. Cannot safely drop group_id from the index."
+                    )
+
                     n_available = self._read_int_attr(tract_group, 'n_streamlines')
                     all_tract_sizes.append(n_available)
                     tract_metadata.append((file_path, group_name, file_id, group_id, tract_id, n_available))
@@ -287,13 +231,15 @@ class StreamlineDataset(Dataset):
         # Adaptive threshold: 5% of the largest bundle
         max_bundle_size = max(all_tract_sizes) if all_tract_sizes else 1000
         adaptive_threshold = int(max_bundle_size * 0.05)
-        if self.full_sample_threshold is not None:
-            adaptive_threshold = min(adaptive_threshold, self.full_sample_threshold)
-        print(f"  Adaptive full-sample threshold: {adaptive_threshold} "
-            f"(5% of max bundle={max_bundle_size})")
+        if self.verbose:
+            print(f"  Adaptive full-sample threshold: {adaptive_threshold} "
+                f"(5% of max bundle={max_bundle_size})")
         
         # Second pass: sample streamlines using the adaptive threshold
         index_entries = []
+
+        n_available_per_tract: Dict[int, int] = {}
+        n_sampled_per_tract: Dict[int, int] = {}
         
         for file_path, group_name, file_id, group_id, tract_id, n_available in tract_metadata:
             with h5py.File(file_path, 'r') as f:
@@ -312,6 +258,9 @@ class StreamlineDataset(Dataset):
                 n_to_sample = min(n_to_sample, self.max_streamlines_per_tract)
             
             n_to_sample = min(n_to_sample, n_available)
+
+            n_available_per_tract[tract_id] = n_available_per_tract.get(tract_id, 0) + n_available
+            n_sampled_per_tract[tract_id] = n_sampled_per_tract.get(tract_id, 0) + n_to_sample
             
             # Sample indices using seeded RNG
             if n_to_sample < n_available:
@@ -323,7 +272,6 @@ class StreamlineDataset(Dataset):
             for idx in sampled_indices:
                 index_entries.append((
                     file_id,
-                    group_id,
                     int(idx),
                     int(lengths[idx]),
                     int(tract_id)
@@ -331,17 +279,23 @@ class StreamlineDataset(Dataset):
         
         # Convert to NumPy structured array (huge memory savings)
         self.streamline_index = np.array(index_entries, dtype=self.INDEX_DTYPE)
+
+        self.fully_sampled_tracts = {
+            tid for tid in n_available_per_tract
+            if n_sampled_per_tract[tid] == n_available_per_tract[tid]
+        }
         
-        print(f"Total streamlines indexed: {len(self.streamline_index)}")
-        
-        # Memory usage info
-        memory_mb = self.streamline_index.nbytes / (1024 * 1024)
-        print(f"  Index memory: {memory_mb:.1f} MB")
-        
-        # Count per class using NumPy (efficient)
-        unique_classes, counts = np.unique(self.streamline_index['tract_id'], return_counts=True)
-        print(f"  Classes: {len(unique_classes)}")
-        print(f"  Streamlines per class: min={counts.min()}, max={counts.max()}")
+        if self.verbose:
+            print(f"Total streamlines indexed: {len(self.streamline_index)}")
+
+            # Memory usage info
+            memory_mb = self.streamline_index.nbytes / (1024 * 1024)
+            print(f"  Index memory: {memory_mb:.1f} MB")
+            
+            # Count per class using NumPy (efficient)
+            unique_classes, counts = np.unique(self.streamline_index['tract_id'], return_counts=True)
+            print(f"  Classes: {len(unique_classes)}")
+            print(f"  Streamlines per class: min={counts.min()}, max={counts.max()}")
     
     def __len__(self):
         if self.streamline_index is None:
@@ -400,7 +354,7 @@ class StreamlineDataset(Dataset):
         
         # Get cached file handle (much faster than opening/closing each time)
         file_handle = self._get_file_handle(int(item['file_id']))
-        group_name = f"tract_{item['group_id']}"
+        group_name = f"tract_{item['tract_id']}"
         
         tract_group = file_handle[group_name]
         
@@ -445,29 +399,3 @@ def streamline_collate_fn(batch: List[Tuple[torch.Tensor, int, int]]) -> Tuple[t
     padded_streamlines = pad_sequence(streamlines, batch_first=True, padding_value=0.0)
     
     return padded_streamlines, lengths, labels
-
-
-
-
-# import h5py
-# from collections import defaultdict
-# from pathlib import Path
-
-# train_dir = Path("sequences/trainset")
-# train_files = sorted([str(f) for f in train_dir.glob("*.hdf5")])
-
-# total_per_bundle = defaultdict(int)
-
-# for fpath in train_files:
-#     with h5py.File(fpath, "r") as f:
-#         for group_name in f.keys():
-#             if not group_name.startswith("tract_"):
-#                 continue
-#             tract_id = int(f[group_name].attrs["tract_id"])
-#             n = int(f[group_name].attrs["n_streamlines"])
-#             total_per_bundle[tract_id] += n
-
-# # Sort by number of streamlines (descending)
-# for bid, n in sorted(total_per_bundle.items(), key=lambda kv: kv[1], reverse=True):
-#     print(f"  Bundle {bid}: {n:,} streamlines")
-

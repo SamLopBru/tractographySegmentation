@@ -2,6 +2,7 @@ from nibabel.streamlines.array_sequence import ArraySequence
 import numpy as np
 from dipy.io.streamline import load_tractogram
 from dipy.io.stateful_tractogram import StatefulTractogram
+from dipy.io.utils import Space
 from typing import Optional, Tuple, Dict, List, Union
 import pathlib
 import pandas as pd
@@ -117,7 +118,8 @@ class SphericalSequencer:
                     if not isinstance(sft, StatefulTractogram):
                         print(f"Warning: failed to load tractogram '{tract_path}', skipping.")
                         continue
-
+                    
+                    sft.to_space(Space.RASMM)  # Ensure streamlines are in RASMM space
                     processed = self._process_tract_streamlines(sft.streamlines, com, r_min, r_max)
                     del sft
 
@@ -166,10 +168,10 @@ class SphericalSequencer:
             raise e
 
 
-def _extract_subject_norm_params(df: pd.DataFrame, subject: str) -> dict:
+def _extract_subject_norm_params(df: pd.DataFrame, subject: str) -> Optional[dict]:
         matches = df[df['subject'] == subject]
         if matches.empty:
-            raise ValueError(f"Subject '{subject}' not found in normalization CSV.")
+            return None
         row = matches.iloc[0]
         return {
             "com": (row['com_x'], row['com_y'], row['com_z']),
@@ -210,6 +212,10 @@ def main(scope: str, dataset_path: str, csv_path: Optional[str], output_dir: str
         futures = {}
         for subject in subjects:
             norm_params = _extract_subject_norm_params(normalization_df, subject["subject"])
+            if norm_params is None:
+                print(f"Warning: No normalization parameters found for subject '{subject['subject']}', skipping.")
+                continue
+            
             futures[executor.submit(
                 _process_one_subject, subject, ENCODED_TRACTS, norm_params, scope, output_dir
             )] = subject["subject"]
