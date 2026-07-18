@@ -4,13 +4,15 @@ import math
 
 
 class SinusoidalPositionalEncoding(nn.Module):
+    pe: torch.Tensor # explicit typing for the buffer
+
     def __init__(self, model_dim: int, max_len: int = 5000, dropout: float = 0.1):
         super().__init__()
 
         if max_len > 10000.0:
             raise ValueError(f"max_len should be less than or equal to 10000. Got {max_len}.")
 
-        self.pe = torch.zeros(max_len, model_dim)
+        pe = torch.zeros(max_len, model_dim)
         self.model_dim = model_dim
         self.dropout = nn.Dropout(p=dropout)
 
@@ -21,10 +23,10 @@ class SinusoidalPositionalEncoding(nn.Module):
             * (-math.log(10000.0) / model_dim)
         )
 
-        self.pe[:, 0::2] = torch.sin(position * div_term)
-        self.pe[:, 1::2] = torch.cos(position * div_term)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
         
-        self.register_buffer('pe', self.pe)
+        self.register_buffer('pe', pe) # correctly moves pe with the module to the device
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.pe[:x.size(1)]
