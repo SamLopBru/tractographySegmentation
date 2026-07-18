@@ -8,6 +8,7 @@ class TransformerEncoder(nn.Module):
             self,
             input_dim: int = 5,
             model_dim: int = 128,
+            dim_feedforward: int = 512,
             num_heads: int = 8,
             num_layers: int = 4,
             dropout: float = 0.1,
@@ -25,6 +26,7 @@ class TransformerEncoder(nn.Module):
             raise ValueError(f"Invalid positional encoding: {positional_encoding}. Must be one of ['sinusoidal', 'rope'].")
 
         self.model_dim = model_dim
+        self.dim_feedforward = dim_feedforward
         self.dropout = dropout
         self.pooling_strategy = pooling_strategy
         self.input_projection = nn.Linear(input_dim, model_dim)
@@ -41,7 +43,7 @@ class TransformerEncoder(nn.Module):
         self.encoder_layers = TransformerEncoderLayer(
                 d_model=model_dim,
                 nhead=num_heads,
-                dim_feedforward=model_dim * 4,
+                dim_feedforward=self.dim_feedforward,
                 dropout=self.dropout,
                 activation='gelu',
                 norm_first=True,
@@ -82,14 +84,58 @@ class TransformerEncoder(nn.Module):
                 nn.init.zeros_(module.bias)
     
     def get_embeddings(self,
-                    x: torch.Tensor) -> torch.Tensor:
+                    x: torch.Tensor,
+                    lengths: torch.Tensor # (B,)
+                    ) -> torch.Tensor:
         """
         Get the embeddings from the transformer encoder. This function is separted from
         the forward pass to allow for flexibility in using the embeddings for different tasks (such
         as contrastive learning or t-SNE visualization).
         """
 
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, _ = x.shape  # (B, seq_len, 5)
 
-        pass
+        x = self.input_projection(x) # (B, seq_len, d_model)
+
+        # Create padding mask from lengths
+        indices = torch.arange(seq_len, device=x.device).unsqueeze(0) # (1, seq_len)
+        padding_mask = indices >= lengths.unsqueeze(1) # (B, seq_len) when greater than the real length, the value is True
+
+        if self.pooling_strategy == "cls":
+            # Expand the cls token to match the batch size
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1) # (B, seq_len +1, d_model)
+            
+            # Append a False for the padding mask 
+            cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)  # (B, 1)
+            padding_mask = torch.cat((cls_mask, padding_mask), dim=1)  # (B, seq_len + 1)
+        
+        
+        if self.positional_encoding is not None:
+            x = self.positional_encoding(x)
+        
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask) # (B, seq_len [+1 if cls], d_model)
+        
+        if self.pooling_strategy == "cls":
+            x_pooled = x[:, 0]
+        elif self.pooling_strategy == "mean":
+            mask = ~padding_mask.unsqueeze(-1) # (B, seq_len, 1)
+            x_pooled = x.sum(dim=1) / mask.sum(dim=1).clamp(min=1) # clamp to avoid dividing by 0
+        elif self.pooling_strategy == "max":
+            x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf')) # (B, seq_len, 1)
+            x_pooled = x.max(dim=1)[0].clamp(min=-1e9)
+        else:
+            raise ValueError(f"Unknown pooling strategy: {self.pooling_strategy}")
+        
+        return x_pooled # (B, d_model)
+    
+    def forward(self,
+                x: torch.Tensor,
+                lengths: torch.Tensor
+                ) -> torch.Tensor:
+        
+        x_pooled = self.get_embeddings(x, lengths)
+        logits = self.classifier(x_pooled)
+
+        return logits
     
