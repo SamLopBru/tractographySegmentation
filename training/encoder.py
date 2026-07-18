@@ -4,6 +4,12 @@ from torch.nn import TransformerEncoderLayer
 from .positional_encoders import SinusoidalPositionalEncoding
 
 class TransformerEncoder(nn.Module):
+    """
+    Transformer based encoder for classifying streamlines into bundles
+
+    Input: Streamlines of shape (B, max_seq_len, 5)
+    Output: Class logits of shape (B, num_classes)
+    """
     def __init__(
             self,
             input_dim: int = 5,
@@ -27,24 +33,24 @@ class TransformerEncoder(nn.Module):
 
         self.model_dim = model_dim
         self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
+        self.dropout_p = dropout
         self.pooling_strategy = pooling_strategy
         self.input_projection = nn.Linear(input_dim, model_dim)
 
         # Initialize cls token if pooling strategy is 'cls'
         if self.pooling_strategy == "cls":
-            self.cls_token = nn.Parameter(torch.rand(1, 1, model_dim))
+            self.cls_token = nn.Parameter(torch.empty(1, 1, model_dim)) # does not mind if it's empty because it's going to be reinitialized
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
         if positional_encoding == "sinusoidal":
-            self.positional_encoding = SinusoidalPositionalEncoding(self.model_dim, dropout=self.dropout)
+            self.positional_encoding = SinusoidalPositionalEncoding(self.model_dim, dropout=self.dropout_p)
         
         # Create the transformer encoder layers
         self.encoder_layers = TransformerEncoderLayer(
                 d_model=model_dim,
                 nhead=num_heads,
                 dim_feedforward=self.dim_feedforward,
-                dropout=self.dropout,
+                dropout=self.dropout_p,
                 activation='gelu',
                 norm_first=True,
                 batch_first=True
@@ -54,7 +60,7 @@ class TransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer=self.encoder_layers,
             num_layers=num_layers,
-            enable_nested_tensor=True
+            enable_nested_tensor=True # maybe this is silently ignored because norm_first=True
         )
 
         # Create the classifier head
@@ -62,13 +68,12 @@ class TransformerEncoder(nn.Module):
             nn.LayerNorm(model_dim),
             nn.Linear(model_dim, model_dim),
             nn.GELU(),
-            nn.Dropout(p=self.dropout),
+            nn.Dropout(p=self.dropout_p),
             nn.Linear(model_dim, num_classes)
         )
 
         self._init_weights()
         
-
     def _init_weights(self):
         """
         Initialize weights for the model using Xavier uniform initialization for 
@@ -93,36 +98,36 @@ class TransformerEncoder(nn.Module):
         as contrastive learning or t-SNE visualization).
         """
 
-        batch_size, seq_len, _ = x.shape  # (B, seq_len, 5)
+        batch_size, max_seq_len, _ = x.shape  # (B, max_seq_len, 5)
 
-        x = self.input_projection(x) # (B, seq_len, d_model)
+        x = self.input_projection(x) # (B, max_seq_len, d_model)
 
         # Create padding mask from lengths
-        indices = torch.arange(seq_len, device=x.device).unsqueeze(0) # (1, seq_len)
-        padding_mask = indices >= lengths.unsqueeze(1) # (B, seq_len) when greater than the real length, the value is True
+        indices = torch.arange(max_seq_len, device=x.device).unsqueeze(0) # (1, max_seq_len)
+        padding_mask = indices >= lengths.unsqueeze(1) # (B, max_seq_len) when greater than the real length, the value is True
 
         if self.pooling_strategy == "cls":
             # Expand the cls token to match the batch size
             cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1) # (B, seq_len +1, d_model)
+            x = torch.cat((cls_tokens, x), dim=1) # (B, max_seq_len +1, d_model)
             
             # Append a False for the padding mask 
             cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)  # (B, 1)
-            padding_mask = torch.cat((cls_mask, padding_mask), dim=1)  # (B, seq_len + 1)
+            padding_mask = torch.cat((cls_mask, padding_mask), dim=1)  # (B, max_seq_len + 1)
         
         
         if self.positional_encoding is not None:
             x = self.positional_encoding(x)
         
-        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask) # (B, seq_len [+1 if cls], d_model)
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask) # (B, max_seq_len [+1 if cls], d_model)
         
         if self.pooling_strategy == "cls":
             x_pooled = x[:, 0]
         elif self.pooling_strategy == "mean":
-            mask = ~padding_mask.unsqueeze(-1) # (B, seq_len, 1)
+            mask = ~padding_mask.unsqueeze(-1) # (B, max_seq_len, 1)
             x_pooled = x.sum(dim=1) / mask.sum(dim=1).clamp(min=1) # clamp to avoid dividing by 0
         elif self.pooling_strategy == "max":
-            x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf')) # (B, seq_len, 1)
+            x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf')) # (B, max_seq_len, 1)
             x_pooled = x.max(dim=1)[0].clamp(min=-1e9)
         else:
             raise ValueError(f"Unknown pooling strategy: {self.pooling_strategy}")
