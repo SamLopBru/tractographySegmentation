@@ -10,13 +10,12 @@ import time
 import os
 import sys
 import gc
-import argparse
 
-from encoder import TransformerEncoder
 from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
+from utils.helpers import _get_loader, _get_encoder, _parse_args
 
 
 def train_epoch(model: nn.Module,
@@ -26,7 +25,7 @@ def train_epoch(model: nn.Module,
                 criterion: nn.Module,
                 scaler: GradScaler,
                 accumulation_steps: int,
-                scheduler: torch.optim.lr_scheduler._LRScheduler,
+                scheduler: torch.optim.lr_scheduler.SequentialLR,
                 use_amp: bool,
                 log_interval: int = 100):
     
@@ -94,7 +93,7 @@ def train_epoch(model: nn.Module,
     'grad_norm': total_grad_norm / max(1, grad_norm_count)
     }
 
-@torch.no_grad
+@torch.no_grad()
 def validate_epoch(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -104,8 +103,8 @@ def validate_epoch(
 ):
     model.eval()
 
-    total_loss = 0.0
-    total_correct = 0
+    total_loss = torch.tensor(0.0, device=device)
+    total_correct = torch.tensor(0.0, device=device)
     total_samples = 0
 
     all_labels = []
@@ -113,9 +112,8 @@ def validate_epoch(
 
     amp_ctx = autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
 
-    # PORQUE NON_BLOCKING?
     for streamlines, lengths, labels in dataloader:
-        streamlines = streamlines.to(device, non_blocking=True)
+        streamlines = streamlines.to(device, non_blocking=True) # asynchronous host-to-device copy
         lengths = lengths.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -123,18 +121,17 @@ def validate_epoch(
             logits = model(streamlines, lengths)
             loss = loss_fn(logits, labels)
 
-        total_loss += loss.item() * labels.size(0)
+        total_loss += loss.detach() * labels.size(0)
         predictions = logits.argmax(dim=1)
-        total_correct += (predictions == labels).sum().item()
+        total_correct += (predictions == labels).sum()
         total_samples += labels.size(0)
 
-        # PORQUE PASARLO A CPU??
         all_labels.extend(labels.cpu().numpy())
         all_preds.extend(predictions.cpu().numpy())
 
     return{
-        'loss': total_loss / total_samples,
-        'accuracy': 100.0 * total_correct / total_samples,
+        'loss': (total_loss / total_samples).item(),
+        'accuracy': 100.0 * (total_correct / total_samples).item(),
         'macro_f1': f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
     }
     
@@ -146,16 +143,13 @@ def train_loop(model: nn.Module,
             val_sampler: StratifiedEpochSampler,
             device: torch.device,
             use_amp: bool,
-            optimizer: torch.optim.Optimizer,
-            # learning_rate: float,
-            # weight_decay: float,
+            learning_rate: float,
+            weight_decay: float,
             num_epochs: int,
             patience: int,
             accumulation_steps: int,
-            warmup_steps: int,
-            scaler: GradScaler,
-            scheduler: torch.optim.lr_scheduler._LRScheduler,
             save_dir: str,
+            warmup_steps: int,
             validate_every: int = 2,
             verbose: bool = False):
 
@@ -163,6 +157,31 @@ def train_loop(model: nn.Module,
 
     if use_amp and device.type != 'cuda':
         raise ValueError("AMP requires CUDA device, turn use_amp to True")
+
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or "bias" in name or "norm" in name.lower():
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    # No applying weight decay to bias and normalization layers (https://arxiv.org/pdf/2305.17212)
+    optimizer = torch.optim.AdamW([
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ], lr=learning_rate)
+
+    scaler = GradScaler(enabled=use_amp)
+
+    steps_per_epoch = len(train_loader) // accumulation_steps
+    total_training_steps = steps_per_epoch * num_epochs
+
+    # Scheduler setup: Warmup + Cosine Annealing
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer=optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=total_training_steps - warmup_steps)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer=optimizer, schedulers=[warmup_scheduler,cosine_scheduler], milestones=[warmup_steps])
     
     history = {
         'train_loss': [], 'train_acc': [],
@@ -172,7 +191,6 @@ def train_loop(model: nn.Module,
 
     best_val_f1 = 0.0
     patience_counter = 0
-    start_epoch = 1
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -189,7 +207,7 @@ def train_loop(model: nn.Module,
         if verbose: 
             print(f"\n Train loss: {train_metrics['loss']:.4} | Train Acc: {train_metrics['accuracy']:.2}%")
 
-        should_validate = (epoch % validate_every == 0) or (epoch == num_epochs)
+        should_validate = ((epoch % validate_every == 0) or (epoch == num_epochs - 1) and (epoch != 0))
 
         if should_validate:
             val_sampler.set_epoch(epoch)
@@ -273,113 +291,65 @@ def train_loop(model: nn.Module,
 
 def main():
 
-    config = GlobalConfiguration
+    config = GlobalConfiguration()
+    args = _parse_args(config)
 
-    parser = argparse.ArgumentParser(description="Streamline classification training arguments.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-    parser.add_argument('--experiment-name', type=str, required=True,
-                        help="Name of this experiment")
+    # Initialize the loss function
+    criterion = _make_loss(args.loss_type, device)
 
-    parser.add_argument('--experiment-description', type=str, default=None,
-                        help="Description or motive for the experiment")
+    # Initialize Encoder model
+    model = _get_encoder(encoder_type=args.encoder_type, 
+                        input_dim=args.input_dim,
+                        model_dim=args.model_dim,
+                        dim_feedforward=args.feedfoward_dim,
+                        num_heads=args.num_heads,
+                        num_layers=args.num_layers,
+                        dropout=args.dropout,
+                        num_classes=args.num_classes,
+                        pooling_strategy=args.pooling_strategy,
+                        positional_encoding=args.positional_encoding)
 
-    parser.add_argument('--train-dir', type=str, default=config.trainLoader_path,
-                        help="Directoyy path of the training data")
-
-    parser.add_argument('--val-dir', type=str, default=config.valLoader_path,
-                        help="Directory path of the validation data")
-
-    parser.add_argument('--encoder-type', type=str, default=config.encoder_type,
-                        help="Name of the encoder it is going to be used")
-
-    parser.add_argument('--loss_type', str=str, default=config.loss_fn_type, choices=['ce', 'focal'],
-                        help="Name of the loss function to be used")
-    
-    parser.add_argument('--input_dim', type=int, default=config.input_dim,
-                        help="Value of the input dimension")
-
-    parser.add_argument('--num_classes', type=int, default=config.num_classes,
-                        help="Number of classes to predict")
-
-    parser.add_argument('--model_dim', type=int, default=config.model_dim,
-                        help="Dimension of the model embeddings")
-
-    parser.add_argument('--feedfoward_dim', type=int, default=config.feedforward_dim,
-                        help="Dimension of the feedforward layers in the encoder")
-
-    parser.add_argument('--num_heads', type=int, default=config.num_heads,
-                        help="Num heads of the Transformer encoder")
-
-    parser.add_argument('--num_layers', type=int, default=config.num_layers,
-                        help="Number of layers of the encoder")
-
-    parser.add_argument('--dropout', type=float, default=config.dropout,
-                        help="Probability of dropout")
-
-    parser.add_argument('--pooling_strategy', type=str, default=config.pooling_strategy, choices=['cls', 'mean', 'max'],
-                        help="Pooling strategy for the encoder")
-
-    parser.add_argument('--positional_encoding', type=str, default=config.positional_encoding,
-                        help="Postional encoding to use in the Transformer encoder. Available values: ['sinusoidal']")
-
-    parser.add_argument('--loss_fn', type=int, default=config.loss_fn_type,
-                        help="Loss function to be used during training. Available values: ['ce', 'focal']")
-
-    parser.add_argument('--use_amp', action='store_false',
-                        help="Activates or deactivates the mixed precision during training. Default True")
-
-    parser.add_argument('--learning_rate', type=float, default=config.learning_rate,
-                        help="Learning rate value")
-
-    parser.add_argument('--weight_decay', type=float, default=config.weight_decay,
-                        help="Wieght decay value")
-
-    parser.add_argument('--num_epochs', type=int, default=config.num_epochs,
-                        help="Number of epochs during training")
-
-    parser.add_argument('--patience', type=int, default=config.patience,
-                        help="Patience epochs before early stopping")
-
-    parser.add_argument('--warmup_steps', type=int, default=config.warmup_steps,
-                        help="Warmup steps for the learning rate")
-
-    parser.add_argument('--accumulation-steps', type=int, default=config.accumulation_steps,
-                        help="Number of steps for accumulating gradients")
-
-    parser.add_argument('--validate_every', type=int, default=config.validate_every,
-                        help="Number of epochs before doing a validation epoch")    
-
-    args = parser.parse_args()
-
-    model = TransformerEncoder(input_dim=args.input_dim, 
-                            model_dim=args.model_dim,
-                            dim_feedforward=args.feedfoward_dim,
-                            num_heads=args.num_heads,
-                            num_layers=args.num_layers,
-                            dropout=args.dropout,
-                            num_classes=args.num_classes,
-                            pooling_strategy=args.pooling_strategy,
-                            positional_encoding=args.positional_encoding
-                            )
-
-    criterion = _make_loss(args.loss_type)
-
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
-    # Learning rate warmup steps
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer=optimizer, start_factor=args.learning_rate, total_iters=args.warmup_steps)
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=args.num_epochs)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer=optimizer, schedulers=[warmup_scheduler,cosine_scheduler], milestones=[args.warmup_steps])
-
+    # Create data loaders and samplers
+    train_loader, val_loader, train_sampler, val_sampler = _get_loader(train_dir=args.train_dir, 
+                            val_dir=args.val_dir, 
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers,
+                            sampling_percentage_train=args.sampling_percentage_train,
+                            sampling_percentage_val=args.sampling_percentage_val,
+                            min_streamlines=args.min_streamlines,
+                            max_streamlines=args.max_streamlines,
+                            shuffle=True,
+                            seed=args.seed,
+                            verbose=args.verbose)
 
     
+    train_loop(model=model,
+            criterion=criterion,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            train_sampler=train_sampler,
+            val_sampler=val_sampler,
+            num_epochs=args.num_epochs,
+            device=device,
+            use_amp=args.use_amp,
+            patience=args.patience,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            accumulation_steps=args.accumulation_steps,
+            warmup_steps=args.warmup_steps,
+            save_dir=os.path.join(args.save_dir,args.experiment_name),
+            validate_every=args.validate_every,
+            verbose=args.verbose)
+
 
 
 
 
 
 if __name__ == "__main__":
-    pass
+    main()
 
     
