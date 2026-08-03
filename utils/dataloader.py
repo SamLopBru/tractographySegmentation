@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset, Sampler, DataLoader
+from torch.utils.data import Dataset, Sampler
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from typing import Dict, List, Tuple, Optional, Iterator, cast
@@ -156,10 +156,9 @@ class StreamlineDataset(Dataset):
         hdf5_file_paths: List[str],
         sampling_percentage: float = 0.10,
         min_streamlines: int = 50,
-        max_streamlines_per_tract: Optional[int] = None,
+        max_streamlines: Optional[int] = None,
         threshold: int = 1000,
         seed: int = 42,
-        cache_dir: Optional[str] = None,
         verbose: bool = False
     ):
         """
@@ -167,16 +166,15 @@ class StreamlineDataset(Dataset):
             hdf5_file_paths: List of HDF5 file paths
             sampling_percentage: Percentage of streamlines to index from each tract (0-1)
             min_streamlines: Minimum number of streamlines per tract
-            max_streamlines_per_tract: Maximum number of streamlines per tract (None = no limit)
+            max_streamlines: Maximum number of streamlines per tract (None = no limit)
             seed: Random seed for reproducibility of the initial sampling
             cache_dir: Optional directory to cache the index (for faster startup)
         """
         self.file_paths = hdf5_file_paths
         self.sampling_percentage = sampling_percentage
         self.min_streamlines = min_streamlines
-        self.max_streamlines_per_tract = max_streamlines_per_tract
+        self.max_streamlines = max_streamlines
         self.seed = seed
-        self.cache_dir = cache_dir
         self.threshold = threshold
         self.verbose = verbose
         
@@ -241,8 +239,8 @@ class StreamlineDataset(Dataset):
                         n_percentage = int(n_available * self.sampling_percentage)
                         n_to_sample = max(self.min_streamlines, n_percentage)
 
-                    if self.max_streamlines_per_tract is not None:
-                        n_to_sample = min(n_to_sample, self.max_streamlines_per_tract)
+                    if self.max_streamlines is not None:
+                        n_to_sample = min(n_to_sample, self.max_streamlines)
 
                     n_to_sample = min(n_to_sample, n_available)
 

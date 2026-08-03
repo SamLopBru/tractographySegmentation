@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -23,13 +24,23 @@ class GlobalConfiguration:
 
     # Training hyperparameters
     # use_amp: bool = True
+    batch_size: int = 1024
     learning_rate: float = 0.1
     weight_decay: float = 0.05
     num_epochs: int = 40
     patience: int = 10
     accumulation_steps: int = 2
-    validate_every = 2
-    warmup_steps = 512
+    validate_every: int = 2
+    warmup_steps: int = 512
+
+    num_workers: int = 4
+    sampling_percentage_train: float = 0.1
+    sampling_percentage_val: float = 0.1
+    min_streamlines: int = 100
+    max_streamlines: Optional[int] = None
+    seed: int = 42
+
+    scheduler_type: str = "cosine"
 
     def __post_init__(self):
         assert self.encoder_type in ['transformer', 'lstm'], f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {self.encoder_type}"
