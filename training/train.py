@@ -10,12 +10,13 @@ import time
 import os
 import sys
 import gc
+import pandas as pd
 
 from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
-from utils.helpers import _get_loader, _get_encoder, _parse_args
+from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, StepsLR
 
 
 def train_epoch(model: nn.Module,
@@ -25,7 +26,7 @@ def train_epoch(model: nn.Module,
                 criterion: nn.Module,
                 scaler: GradScaler,
                 accumulation_steps: int,
-                scheduler: torch.optim.lr_scheduler.SequentialLR,
+                scheduler: StepsLR,
                 use_amp: bool,
                 log_interval: int = 100):
     
@@ -205,7 +206,7 @@ def train_loop(model: nn.Module,
                                     use_amp=use_amp)
         
         if verbose: 
-            print(f"\n Train loss: {train_metrics['loss']:.4} | Train Acc: {train_metrics['accuracy']:.2}%")
+            print(f"\n Train loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
 
         should_validate = ((epoch % validate_every == 0) or (epoch == num_epochs - 1) and (epoch != 0))
 
@@ -280,6 +281,8 @@ def train_loop(model: nn.Module,
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
+
+        break
     if verbose:
 
         print(f"\n{'='*60}")
@@ -295,7 +298,6 @@ def main():
     args = _parse_args(config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
     # Initialize the loss function
     criterion = _make_loss(args.loss_type, device)
@@ -346,10 +348,13 @@ def main():
 
 
 
-
+    _log_experiment(args, csv_path=args.experiment_save_dir)
 
 
 if __name__ == "__main__":
     main()
+
+
+
 
     
