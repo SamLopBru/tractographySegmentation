@@ -6,8 +6,8 @@ from typing import Optional
 class GlobalConfiguration:
 
     # Paths
-    trainLoader_path: str = ""
-    valLoader_path: str = ""
+    trainLoader_path: str = "sequences/testset"
+    valLoader_path: str = "sequences/testset"
 
     # Encoder parameters
     encoder_type: str = 'transformer'
@@ -39,8 +39,6 @@ class GlobalConfiguration:
     min_streamlines: int = 100
     max_streamlines: Optional[int] = None
     seed: int = 42
-
-    scheduler_type: str = "cosine"
 
     def __post_init__(self):
         assert self.encoder_type in ['transformer', 'lstm'], f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {self.encoder_type}"

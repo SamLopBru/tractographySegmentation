@@ -1,16 +1,24 @@
 import argparse
 import os
 import sys
+import csv
+from datetime import datetime
 
-from typing import Optional
+from typing import Optional, Protocol
 
 from torch import nn
-from dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from training.encoder import TransformerEncoder #LSTMEncoder
 from utils.config import GlobalConfiguration
+from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
+
+
+class StepsLR(Protocol):
+    """Class for pylance to recognize the scheduler type"""
+    def step(self, *args, **kwargs) -> None:
+        ...
 
 def _get_stratified_epoch_sampler(train_dataset: StreamlineDataset,
                                 val_dataset: StreamlineDataset,
@@ -134,7 +142,9 @@ def _get_encoder(encoder_type: str = "transformer",
         raise ValueError(f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {encoder_type}")
 
 def _parse_args(config):
-    
+
+    config = GlobalConfiguration()
+
     parser = argparse.ArgumentParser(description="Streamline classification training arguments.")
 
     parser.add_argument('--experiment_name', type=str, required=True,
@@ -142,6 +152,9 @@ def _parse_args(config):
 
     parser.add_argument('--save_dir', type=str, default="checkpoints",
                         help="Directory to save the model checkpoints and logs. If not provided, defaults to './experiments/{experiment_name}'")
+
+    parser.add_argument("--experiment_save_dir", type=str, default="results/training_experiments.csv",
+                        help="Directory to save the model arguments used for the experiment.")
 
     parser.add_argument('--experiment_description', type=str, default=None,
                         help="Description or motive for the experiment")
@@ -155,7 +168,7 @@ def _parse_args(config):
     parser.add_argument('--encoder_type', type=str, default=config.encoder_type,
                         help="Name of the encoder it is going to be used")
 
-    parser.add_argument('--loss_type', str=str, default=config.loss_fn_type, choices=['ce', 'focal'],
+    parser.add_argument('--loss_type', type=str, default=config.loss_fn_type, choices=['ce', 'focal'],
                         help="Name of the loss function to be used")
 
     parser.add_argument('--input_dim', type=int, default=config.input_dim,
@@ -187,9 +200,6 @@ def _parse_args(config):
 
     parser.add_argument('--positional_encoding', type=str, default=config.positional_encoding,
                         help="Postional encoding to use in the Transformer encoder. Available values: ['sinusoidal']")
-
-    parser.add_argument('--loss_fn', type=int, default=config.loss_fn_type,
-                        help="Loss function to be used during training. Available values: ['ce', 'focal']")
 
     parser.add_argument('--use_amp', action='store_false',
                         help="Activates or deactivates the mixed precision during training. Default True")
@@ -237,3 +247,44 @@ def _parse_args(config):
                         help="Activates verbose mode for detailed logging")
 
     return parser.parse_args()
+
+
+def _log_experiment(args: argparse.Namespace, csv_path: str = "experiments_log.csv") -> None:
+    """
+    Appends the current experiment's hyperparameters (all argparse args) as a
+    new row in a shared CSV file. Creates the file with a header if it
+    does not exist yet. If new args are added later, the header is extended
+    automatically and old rows are backfilled with empty values.
+    """
+    args_dict = vars(args).copy()
+    args_dict["timestamp"] = datetime.now().isoformat(timespec="seconds")
+
+    file_exists = os.path.isfile(csv_path)
+
+    if file_exists:
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, [])
+        # Merge fieldnames: keep existing order, append any new ones at the end
+        new_fields = [k for k in args_dict.keys() if k not in existing_header]
+        fieldnames = existing_header + new_fields
+
+        if new_fields:
+            # Header changed: rewrite the whole file with the expanded header
+            with open(csv_path, "r", newline="") as f:
+                rows = list(csv.DictReader(f))
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+    else:
+        fieldnames = list(args_dict.keys())
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writerow(args_dict)
+
+    print(f"Experiment hyperparameters logged to {csv_path}")
