@@ -45,7 +45,7 @@ class GlobalConfiguration:
     bidirectional: bool = True
 
     def __post_init__(self):
-        assert self.encoder_type in ['transformer', 'lstm'], f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {self.encoder_type}"
+        assert self.encoder_type in ['transformer', 'lstm', 'gru'], f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {self.encoder_type}"
 
         assert self.pooling_strategy in ['cls', 'max', 'mean', 'last'], f"Pooling strategy must be one of the following options: ['max', 'mean', 'cls'], got {self.pooling_strategy}"
 

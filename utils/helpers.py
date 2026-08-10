@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-from training.encoder import TransformerEncoder, LSTMEncoder
+from training.encoder import TransformerEncoder, LSTMEncoder, GRUEncoder
 from utils.config import GlobalConfiguration
 from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
 
@@ -150,6 +150,17 @@ def _get_encoder(encoder_type: str = "transformer",
                         num_classes=num_classes,
                         pooling_strategy=pooling_strategy
                     )
+    
+    elif encoder_type == "gru":
+        return GRUEncoder(input_dim=input_dim,
+                        hidden_dim=model_dim,
+                        num_layers=num_layers,
+                        bidirectional=bidirectional,
+                        dropout=dropout,
+                        num_classes=num_classes,
+                        pooling_strategy=pooling_strategy
+                    )
+
     else:
         raise ValueError(f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {encoder_type}")
 

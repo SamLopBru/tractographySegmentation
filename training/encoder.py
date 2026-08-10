@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn import TransformerEncoderLayer, LSTM
+from torch.nn import TransformerEncoderLayer, LSTM, GRU
 from torch.nn.utils.rnn import pack_padded_sequence
 from positional_encoders import SinusoidalPositionalEncoding
 
@@ -167,62 +167,35 @@ class TransformerEncoder(nn.Module):
         logits = self.classifier(x_pooled)
 
         return logits
-    
-class LSTMEncoder(nn.Module):
+
+
+class _RecurrentEncoderBase(nn.Module):
+    """
+    Shared logic for RNN-based sequence encoders (LSTM, GRU, ...).
+    Subclasses must set self.rnn to an nn.LSTM/nn.GRU instance and implement
+    _init_weights() to handle their specific gate layout.
+    """
 
     def __init__(self,
-                input_dim: int = 5,
-                hidden_dim: int = 128,
-                num_layers: int = 2,
-                bias: bool = True, # need to be True for _init_weights to work
-                batch_first: bool = True,
-                dropout: float = 0.1,
-                bidirectional: bool = True,
-                num_classes: int = 32,
+                hidden_dim: int,
+                bidirectional: bool,
+                num_classes: int,
+                dropout: float,
                 pooling_strategy: str = "mean"):
-        
+
         super().__init__()
 
         if pooling_strategy not in ["mean", "max", "last"]:
             raise ValueError(f"Invalid pooling strategy: {pooling_strategy}. Must be one of ['mean', 'max', 'last'].")
 
         self.pooling_strategy = pooling_strategy
-
-        self.lstm = LSTM(input_dim,
-                        hidden_dim,
-                        num_layers,
-                        bias=bias,
-                        batch_first=batch_first,
-                        dropout=dropout,
-                        bidirectional=bidirectional
-        )
+        self.rnn: nn.RNNBase  # set by subclass
 
         self.classifier = ClassifierHead(model_dim=hidden_dim * 2 if bidirectional else hidden_dim,
                                         num_classes=num_classes,
                                         dropout_p=dropout)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        # all the "param" variables are the weights and biases of the LSTM layers in one sigle 1-D tensor
-        for name, param in self.lstm.named_parameters():
-            if "weight_ih" in name:
-                nn.init.xavier_uniform_(param)
-
-            elif "weight_hh" in name:
-                nn.init.orthogonal_(param)
-
-            elif "bias" in name:
-                nn.init.zeros_(param)
-
-                hidden_size = param.shape[0] // 4
-
-                # forget gate initialize to 1 to retain information at the beginning of training: sigmoid(1.0) = 0.731
-                # if the forget gate is initialized to 0, the LSTM will forget everything at the beginning of training: sigmoid(0.0) = 0.5
-                # (https://arxiv.org/abs/1909.09502)
-                with torch.no_grad():
-                    param[hidden_size:2 * hidden_size].fill_(1.0)
-
+    def _init_classifier_weights(self):
         for module in self.classifier.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -233,17 +206,25 @@ class LSTMEncoder(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def _extract_last_hidden(self, h_n: torch.Tensor) -> torch.Tensor:
+        if self.rnn.bidirectional:
+            return torch.cat((h_n[-2], h_n[-1]), dim=1)  # last hidden states from both directions
+        return h_n[-1]  # last hidden state from the last layer
+
+    def _uniform_gate_init_(self, bias_slice: torch.Tensor, eps: float = 1e-2):
+        """In-place UGI: sample gate activations uniformly, convert to logit-space bias (https://arxiv.org/abs/1910.09890)."""
+        with torch.no_grad():
+            activations = torch.empty_like(bias_slice).uniform_(eps, 1 - eps)
+            bias_slice.copy_(torch.log(activations / (1 - activations)))
+
     def get_embeddings(self, x, lengths) -> torch.Tensor:
-        
+
         packed_input = nn.utils.rnn.pack_padded_sequence(input=x, lengths=lengths.cpu(), batch_first=True, enforce_sorted=False)
 
-        packed_output, (h_n, c_n) = self.lstm(packed_input)
+        packed_output, h_n = self._run_rnn(packed_input)
 
         if self.pooling_strategy == "last":
-            if self.lstm.bidirectional:
-                embeddings = torch.cat((h_n[-2], h_n[-1]), dim=1)  # last hidden states from both directions
-            else:
-                embeddings = h_n[-1]  # last hidden state from the last layer
+            embeddings = self._extract_last_hidden(h_n)
 
         else:
             unpacked_output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
@@ -254,13 +235,106 @@ class LSTMEncoder(nn.Module):
 
             else: # pooling_strategy == "max":
                 embeddings = unpacked_output.masked_fill(~mask.unsqueeze(-1), float('-inf')).max(dim=1)[0]
-            
+
         return embeddings
+
+    def _run_rnn(self, packed_input):
+        """Runs self.rnn and returns (packed_output, h_n), unwrapping LSTM's (h_n, c_n) if needed."""
+        raise NotImplementedError
 
     def forward(self, x, lengths) -> torch.Tensor:
         embeddings = self.get_embeddings(x, lengths)
         logits = self.classifier(embeddings)
         return logits
+
+class LSTMEncoder(_RecurrentEncoderBase):
+
+    def __init__(self,
+                input_dim: int = 5,
+                hidden_dim: int = 128,
+                num_layers: int = 2,
+                bias: bool = True,
+                batch_first: bool = True,
+                dropout: float = 0.1,
+                bidirectional: bool = True,
+                num_classes: int = 32,
+                pooling_strategy: str = "mean"):
+
+        super().__init__(hidden_dim=hidden_dim, bidirectional=bidirectional,
+                        num_classes=num_classes, dropout=dropout,
+                        pooling_strategy=pooling_strategy)
+
+        self.rnn = LSTM(input_dim, hidden_dim, num_layers,
+                        bias=bias, batch_first=batch_first,
+                        dropout=dropout, bidirectional=bidirectional)
+
+        self._init_weights()
+
+    def _run_rnn(self, packed_input):
+        packed_output, (h_n, c_n) = self.rnn(packed_input)
+        return packed_output, h_n
+
+    def _init_weights(self):
+        for name, param in self.rnn.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+
+            elif "bias" in name:
+                nn.init.zeros_(param)
+                hidden_size = param.shape[0] // 4
+
+                if "bias_ih" in name: # so bias weights are only initialize once               
+                    self._uniform_gate_init_(param[hidden_size:2 * hidden_size])
+
+
+        self._init_classifier_weights()
+
+class GRUEncoder(_RecurrentEncoderBase):
+
+    def __init__(self,
+                input_dim: int = 5,
+                hidden_dim: int = 128,
+                num_layers: int = 2,
+                bias: bool = True,
+                batch_first: bool = True,
+                dropout: float = 0.1,
+                bidirectional: bool = True,
+                num_classes: int = 32,
+                pooling_strategy: str = "mean"):
+
+        super().__init__(hidden_dim=hidden_dim, bidirectional=bidirectional,
+                        num_classes=num_classes, dropout=dropout,
+                        pooling_strategy=pooling_strategy)
+
+        self.rnn = GRU(input_dim, hidden_dim, num_layers,
+                        bias=bias, batch_first=batch_first,
+                        dropout=dropout, bidirectional=bidirectional)
+
+        self._init_weights()
+
+    def _run_rnn(self, packed_input):
+        packed_output, h_n = self.rnn(packed_input)
+        return packed_output, h_n
+
+    def _init_weights(self):
+        # GRU gate order: reset (r), update (z), new/candidate (n)
+        for name, param in self.rnn.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+
+            elif "bias" in name:
+                nn.init.zeros_(param)
+                hidden_size = param.shape[0] // 3
+                if "bias_ih" in name:  
+                    self._uniform_gate_init_(param[hidden_size:2 * hidden_size])
+
+        self._init_classifier_weights()
 
 
 # model = LSTMEncoder()
