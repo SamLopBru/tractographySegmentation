@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-from training.encoder import TransformerEncoder #LSTMEncoder
+from training.encoder import TransformerEncoder, LSTMEncoder
 from utils.config import GlobalConfiguration
 from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
 
@@ -125,7 +125,8 @@ def _get_encoder(encoder_type: str = "transformer",
                 dropout: float = 0.1,
                 num_classes: int = 32,
                 pooling_strategy: str = "mean",
-                positional_encoding: str = "sinusoidal"
+                positional_encoding: str = "sinusoidal",
+                bidirectional: bool = True
                 ) -> nn.Module:
 
     if encoder_type == "transformer":
@@ -137,7 +138,18 @@ def _get_encoder(encoder_type: str = "transformer",
                                 dropout=dropout,
                                 num_classes=num_classes,
                                 pooling_strategy=pooling_strategy,
-                                positional_encoding=positional_encoding)
+                                positional_encoding=positional_encoding
+                            )
+    
+    elif encoder_type == "lstm":
+        return LSTMEncoder(input_dim=input_dim,
+                        hidden_dim=model_dim,
+                        num_layers=num_layers,
+                        bidirectional=bidirectional,
+                        dropout=dropout,
+                        num_classes=num_classes,
+                        pooling_strategy=pooling_strategy
+                    )
     else:
         raise ValueError(f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {encoder_type}")
 
@@ -222,6 +234,9 @@ def _parse_args(config):
     parser.add_argument('--accumulation-steps', type=int, default=config.accumulation_steps,
                         help="Number of steps for accumulating gradients")
 
+    parser.add_argument('--no_bidirectional', action="store_false",
+                        help="Deactivates LSTM bidertionality")
+
     parser.add_argument('--validate_every', type=int, default=config.validate_every,
                         help="Number of epochs before doing a validation epoch")    
 
@@ -247,7 +262,6 @@ def _parse_args(config):
                         help="Activates verbose mode for detailed logging")
 
     return parser.parse_args()
-
 
 def _log_experiment(args: argparse.Namespace, csv_path: str = "experiments_log.csv") -> None:
     """
@@ -288,3 +302,39 @@ def _log_experiment(args: argparse.Namespace, csv_path: str = "experiments_log.c
         writer.writerow(args_dict)
 
     print(f"Experiment hyperparameters logged to {csv_path}")
+
+def _create_hparams(args: argparse.Namespace) -> dict:
+    """
+    Creates a dictionary of hyperparameters from the argparse Namespace.
+    """
+    model_hparams = {
+        'encoder_type': args.encoder_type,
+        'input_dim': args.input_dim,
+        'model_dim': args.model_dim,
+        'dim_feedforward': args.feedfoward_dim,
+        'num_heads': args.num_heads,
+        'num_layers': args.num_layers,
+        'dropout': args.dropout,
+        'num_classes': args.num_classes,
+        'pooling_strategy': args.pooling_strategy,
+        'positional_encoding': args.positional_encoding,
+    }
+
+    training_hparams = {
+        'learning_rate': args.learning_rate,
+        'weight_decay': args.weight_decay,
+        'batch_size': args.batch_size,
+        'accumulation_steps': args.accumulation_steps,
+        'warmup_steps': args.warmup_steps,
+        'num_epochs': args.num_epochs,
+        'patience': args.patience,
+        'validate_every': args.validate_every,
+        'use_amp': args.use_amp,
+        'loss_type': args.loss_type,
+        'seed': args.seed,
+    }
+
+    hparams = {**model_hparams, **training_hparams}
+
+    return hparams
+

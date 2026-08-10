@@ -21,6 +21,7 @@ class GlobalConfiguration:
     pooling_strategy: str = 'cls'
     positional_encoding: str = 'sinusoidal'
     loss_fn_type: str = "ce"
+    layer_normalization: str = "layernorm"
 
     # Training hyperparameters
     # use_amp: bool = True
@@ -40,9 +41,14 @@ class GlobalConfiguration:
     max_streamlines: Optional[int] = None
     seed: int = 42
 
+    # LSTM hyperaparameters
+    bidirectional: bool = True
+
     def __post_init__(self):
         assert self.encoder_type in ['transformer', 'lstm'], f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {self.encoder_type}"
 
-        assert self.pooling_strategy in ['cls', 'max', 'mean'], f"Pooling strategy must be one of the following options: ['max', 'mean', 'cls'], got {self.pooling_strategy}"
+        assert self.pooling_strategy in ['cls', 'max', 'mean', 'last'], f"Pooling strategy must be one of the following options: ['max', 'mean', 'cls'], got {self.pooling_strategy}"
 
         assert self.loss_fn_type in ['ce', 'focal'], f"Loss function type must be one of the following options: ['ce', 'focal'], got {self.loss_fn_type}"
+
+        assert self.layer_normalization in ['layernorm', 'rmsnorm'], f"Layer normalization must be one of the following options: ['layernorm', 'rmsnorm'], got {self.layer_normalization}"

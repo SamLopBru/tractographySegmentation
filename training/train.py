@@ -16,7 +16,7 @@ from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
-from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, StepsLR
+from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR
 
 
 def train_epoch(model: nn.Module,
@@ -151,8 +151,9 @@ def train_loop(model: nn.Module,
             accumulation_steps: int,
             save_dir: str,
             warmup_steps: int,
-            validate_every: int = 2,
-            verbose: bool = False):
+            validate_every: int,
+            hparams: dict,
+            verbose: bool = False,):
 
     model = model.to(device)
 
@@ -187,7 +188,7 @@ def train_loop(model: nn.Module,
     history = {
         'train_loss': [], 'train_acc': [],
         'val_loss': [], 'val_acc': [], 'val_f1': [],
-        'epoch_time': []  # Track time per epoch
+        'epoch_time': []
     }
 
     best_val_f1 = 0.0
@@ -252,7 +253,7 @@ def train_loop(model: nn.Module,
                 'val_accuracy': val_metrics['accuracy'],
                 'val_macro_f1': best_val_f1,
                 'history': history,
-                # 'params': hparams
+                'params': hparams
             }
 
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
@@ -270,7 +271,7 @@ def train_loop(model: nn.Module,
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            # 'warmup_cosine_scheduler_state': warmup_cosine_scheduler.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             # 'plateau_scheduler_state': plateau_scheduler.state_dict() if plateau_scheduler is not None else None,
             'scaler_state': scaler.state_dict() if scaler is not None else None,
             'best_val_f1': best_val_f1,
@@ -282,7 +283,6 @@ def train_loop(model: nn.Module,
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        break
     if verbose:
 
         print(f"\n{'='*60}")
@@ -312,7 +312,8 @@ def main():
                         dropout=args.dropout,
                         num_classes=args.num_classes,
                         pooling_strategy=args.pooling_strategy,
-                        positional_encoding=args.positional_encoding)
+                        positional_encoding=args.positional_encoding,
+                        bidirectional=args.no_bidirectional)
 
     # Create data loaders and samplers
     train_loader, val_loader, train_sampler, val_sampler = _get_loader(train_dir=args.train_dir, 
@@ -327,7 +328,6 @@ def main():
                             seed=args.seed,
                             verbose=args.verbose)
 
-    
     train_loop(model=model,
             criterion=criterion,
             train_loader=train_loader,
@@ -344,9 +344,9 @@ def main():
             warmup_steps=args.warmup_steps,
             save_dir=os.path.join(args.save_dir,args.experiment_name),
             validate_every=args.validate_every,
-            verbose=args.verbose)
-
-
+            verbose=args.verbose,
+            hparams=_create_hparams(args)
+            )
 
     _log_experiment(args, csv_path=args.experiment_save_dir)
 
