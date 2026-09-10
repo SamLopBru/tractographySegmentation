@@ -303,7 +303,7 @@ def _parse_args(config):
     parser.add_argument('--positional_encoding', type=str, default=config.positional_encoding,
                         help="Postional encoding to use in the Transformer encoder. Available values: ['sinusoidal']")
 
-    parser.add_argument('--use_amp', action='store_false',
+    parser.add_argument('--no_amp', action='store_false',
                         help="Activates or deactivates the mixed precision during training. Default True")
 
     parser.add_argument('--learning_rate', type=float, default=config.learning_rate,
@@ -321,11 +321,11 @@ def _parse_args(config):
     parser.add_argument('--warmup_steps', type=int, default=config.warmup_steps,
                         help="Warmup steps for the learning rate")
 
-    parser.add_argument('--accumulation-steps', type=int, default=config.accumulation_steps,
+    parser.add_argument('--accumulation_steps', type=int, default=config.accumulation_steps,
                         help="Number of steps for accumulating gradients")
 
     parser.add_argument('--no_bidirectional', action="store_false",
-                        help="Deactivates LSTM bidertionality")
+                        help="Deactivates LSTM/GRU bidertionality")
 
     parser.add_argument('--validate_every', type=int, default=config.validate_every,
                         help="Number of epochs before doing a validation epoch")    
@@ -356,9 +356,19 @@ def _parse_args(config):
 
     return parser.parse_args()
 
+def _count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
+    """
+    Counts total (or trainable-only) parameters in a model.
+    """
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
+
 def _log_experiment(
     args: argparse.Namespace,
     history: dict,
+    num_parameters: int,
+    num_trainable_parameters: int,
     csv_path: str = "experiments_log.csv",
     is_resume: bool = False,
 ) -> None:
@@ -378,6 +388,8 @@ def _log_experiment(
     """
     args_dict = vars(args).copy()
     args_dict["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    args_dict["num_parameters"] = num_parameters
+    args_dict["num_trainable_parameters"] = num_trainable_parameters
     args_dict.update(extract_best_values_history(history))
 
     experiment_name = args_dict.get("experiment_name")
@@ -436,7 +448,7 @@ def _log_experiment(
 
     print(f"Experiment hyperparameters logged to {csv_path}")
 
-def _create_hparams(args: argparse.Namespace) -> dict:
+def _create_hparams(args: argparse.Namespace, scaled_learning_rate: float, effective_batch_size: int) -> dict:
     """
     Creates a dictionary of hyperparameters from the argparse Namespace.
     """
@@ -454,15 +466,17 @@ def _create_hparams(args: argparse.Namespace) -> dict:
     }
 
     training_hparams = {
-        'learning_rate': args.learning_rate,
+        'learning_rate_base': args.learning_rate,
+        'learning_rate_scaled': scaled_learning_rate,
         'weight_decay': args.weight_decay,
         'batch_size': args.batch_size,
+        'effective_batch_size': effective_batch_size,
         'accumulation_steps': args.accumulation_steps,
         'warmup_steps': args.warmup_steps,
         'num_epochs': args.num_epochs,
         'patience': args.patience,
         'validate_every': args.validate_every,
-        'use_amp': args.use_amp,
+        'use_amp': args.no_amp,
         'loss_type': args.loss_type,
         'seed': args.seed,
     }

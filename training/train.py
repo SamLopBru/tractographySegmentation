@@ -15,7 +15,13 @@ from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
-from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR, _load_checkpoint, _validate_experiment_state
+from utils.helpers import _count_parameters, _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR, _load_checkpoint, _validate_experiment_state
+
+# https://docs.pytorch.org/docs/2.14/generated/torch.set_float32_matmul_precision.html
+torch.set_float32_matmul_precision('high') 
+
+# https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html#enable-cudnn-auto-tuner
+# torch.backends.cudnn.benchmark = True
 
 
 def train_epoch(model: nn.Module,
@@ -37,7 +43,9 @@ def train_epoch(model: nn.Module,
     total_grad_norm = 0.0
     grad_norm_count = 0
 
-    optimizer.zero_grad()
+    # Using set_to_none=True because it can slightly improve performance and memory usage
+    # https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html#use-parameter-grad-none-instead-of-model-zero-grad-or-optimizer-zero-grad
+    optimizer.zero_grad(set_to_none=True)
 
     amp_ctx = autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
 
@@ -63,7 +71,7 @@ def train_epoch(model: nn.Module,
 
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             if is_finite:
                 total_grad_norm += grad_norm.item()
@@ -346,6 +354,22 @@ def main():
                             seed=args.seed,
                             verbose=args.verbose)
 
+    num_parameters = _count_parameters(model)
+    num_trainable_parameters = _count_parameters(model, trainable_only=True)
+    print(f"Total model parameters: {num_parameters:,}")
+    print(f"Trainable model parameters: {num_trainable_parameters:,}")
+
+    # Compute effective batch size and scale learning rate accordingly
+    effective_batch_size = args.batch_size * args.accumulation_steps
+    reference_batch_size = 256
+    scaled_learning_rate = args.learning_rate * (effective_batch_size / reference_batch_size) ** 0.5
+
+    if args.verbose:
+        print(f"Effective batch size: {effective_batch_size} "
+            f"(batch_size={args.batch_size} x accumulation_steps={args.accumulation_steps})")
+        print(f"LR scaled: {args.learning_rate:.2e} -> {scaled_learning_rate:.2e} "
+            f"(reference_batch_size={reference_batch_size})")
+        
     history = train_loop(model=model,
             criterion=criterion,
             train_loader=train_loader,
@@ -354,20 +378,20 @@ def main():
             val_sampler=val_sampler,
             num_epochs=args.num_epochs,
             device=device,
-            use_amp=args.use_amp,
+            use_amp=args.no_amp,
             patience=args.patience,
-            learning_rate=args.learning_rate,
+            learning_rate=scaled_learning_rate,
             weight_decay=args.weight_decay,
             accumulation_steps=args.accumulation_steps,
             warmup_steps=args.warmup_steps,
             save_dir=os.path.join(args.save_dir,args.experiment_name),
             validate_every=args.validate_every,
             verbose=args.verbose,
-            hparams=_create_hparams(args),
+            hparams=_create_hparams(args, scaled_learning_rate, effective_batch_size),
             resume_checkpoint_path=args.resume_checkpoint_path
     )
 
-    _log_experiment(args, csv_path=args.experiment_save_dir, history=history, is_resume=is_resume)
+    _log_experiment(args, csv_path=args.experiment_save_dir, history=history, num_parameters=num_parameters, num_trainable_parameters=num_trainable_parameters, is_resume=is_resume)
 
 
 if __name__ == "__main__":
