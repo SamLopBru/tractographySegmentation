@@ -3,14 +3,15 @@ import os
 import sys
 import csv
 from datetime import datetime
+import torch
 
 from typing import Optional, Protocol
 
-from torch import nn
+from torch import Value, nn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-from training.encoder import TransformerEncoder #LSTMEncoder
+from training.encoder import TransformerEncoder, LSTMEncoder, GRUEncoder
 from utils.config import GlobalConfiguration
 from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
 
@@ -19,6 +20,21 @@ class StepsLR(Protocol):
     """Class for pylance to recognize the scheduler type"""
     def step(self, *args, **kwargs) -> None:
         ...
+
+def extract_best_values_history(history: dict) -> dict:
+
+    """
+    Extracts the best values from the training history dictionary.
+    """
+    best_values = {
+        'best_train_loss': min(history['train_loss']) if history['train_loss'] else None,
+        'best_train_acc': max(history['train_acc']) if history['train_acc'] else None,
+        'best_val_loss': min(history['val_loss']) if history['val_loss'] else None,
+        'best_val_acc': max(history['val_acc']) if history['val_acc'] else None,
+        'best_val_f1': max(history['val_f1']) if history['val_f1'] else None,
+        'average_epoch_time': sum(history['epoch_time']) / len(history['epoch_time']) if history['epoch_time'] else None
+    }
+    return best_values
 
 def _get_stratified_epoch_sampler(train_dataset: StreamlineDataset,
                                 val_dataset: StreamlineDataset,
@@ -125,7 +141,8 @@ def _get_encoder(encoder_type: str = "transformer",
                 dropout: float = 0.1,
                 num_classes: int = 32,
                 pooling_strategy: str = "mean",
-                positional_encoding: str = "sinusoidal"
+                positional_encoding: str = "sinusoidal",
+                bidirectional: bool = True
                 ) -> nn.Module:
 
     if encoder_type == "transformer":
@@ -137,9 +154,57 @@ def _get_encoder(encoder_type: str = "transformer",
                                 dropout=dropout,
                                 num_classes=num_classes,
                                 pooling_strategy=pooling_strategy,
-                                positional_encoding=positional_encoding)
+                                positional_encoding=positional_encoding
+                            )
+    
+    elif encoder_type == "lstm":
+        return LSTMEncoder(input_dim=input_dim,
+                        hidden_dim=model_dim,
+                        num_layers=num_layers,
+                        bidirectional=bidirectional,
+                        dropout=dropout,
+                        num_classes=num_classes,
+                        pooling_strategy=pooling_strategy
+                    )
+    
+    elif encoder_type == "gru":
+        return GRUEncoder(input_dim=input_dim,
+                        hidden_dim=model_dim,
+                        num_layers=num_layers,
+                        bidirectional=bidirectional,
+                        dropout=dropout,
+                        num_classes=num_classes,
+                        pooling_strategy=pooling_strategy
+                    )
+
     else:
         raise ValueError(f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {encoder_type}")
+
+def _check_experiment_name(csv_path: str, experiment_name: str, is_resume: bool = False) -> None:
+    """
+    Checks if the experiment name already exists in the CSV file.
+    Raises a ValueError only for brand-new runs reusing an existing name;
+    resumed runs are expected to reuse their original name.
+    """
+    if not os.path.isfile(csv_path):
+        return
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        existing_experiment_names = {row[0] for row in reader if row}
+
+    if experiment_name in existing_experiment_names and not is_resume:
+        raise ValueError(
+            f"Experiment name '{experiment_name}' already exists in {csv_path}. "
+            "Please choose a different name, or pass --resume_checkpoint_path if you intend to continue it."
+        )
+
+    if experiment_name not in existing_experiment_names and is_resume:
+        raise ValueError(
+            f"Experiment name '{experiment_name}' does not exist in {csv_path}. "
+            "Please choose a different name, or ensure the resume checkpoint path is correct."
+        )
 
 def _parse_args(config):
 
@@ -222,6 +287,9 @@ def _parse_args(config):
     parser.add_argument('--accumulation-steps', type=int, default=config.accumulation_steps,
                         help="Number of steps for accumulating gradients")
 
+    parser.add_argument('--no_bidirectional', action="store_false",
+                        help="Deactivates LSTM bidertionality")
+
     parser.add_argument('--validate_every', type=int, default=config.validate_every,
                         help="Number of epochs before doing a validation epoch")    
 
@@ -246,45 +314,162 @@ def _parse_args(config):
     parser.add_argument('--verbose', action='store_true',
                         help="Activates verbose mode for detailed logging")
 
+    parser.add_argument('--resume_checkpoint_path', type=str, default=None,
+                        help="Path to the checkpoint for resuming training")
+
     return parser.parse_args()
 
-
-def _log_experiment(args: argparse.Namespace, csv_path: str = "experiments_log.csv") -> None:
+def _log_experiment(
+    args: argparse.Namespace,
+    history: dict,
+    csv_path: str = "experiments_log.csv",
+    is_resume: bool = False,
+) -> None:
     """
-    Appends the current experiment's hyperparameters (all argparse args) as a
-    new row in a shared CSV file. Creates the file with a header if it
-    does not exist yet. If new args are added later, the header is extended
-    automatically and old rows are backfilled with empty values.
+    Logs the current experiment's hyperparameters and best metrics as a row
+    in a shared CSV file.
+
+    - If this is a fresh run (is_resume=False), a new row is appended.
+    - If this is a resumed run (is_resume=True) and a row already exists for
+    args.experiment_name, that row is updated in place instead of appending
+    a duplicate. If no matching row is found, a warning is printed and a
+    new row is appended instead.
+
+    Creates the file with a header if it does not exist yet. If new args or
+    metric fields are introduced later, the header is extended automatically
+    and old rows are backfilled with empty values.
     """
     args_dict = vars(args).copy()
     args_dict["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    args_dict.update(extract_best_values_history(history))
 
+    experiment_name = args_dict.get("experiment_name")
     file_exists = os.path.isfile(csv_path)
+
+    existing_rows = []
+    existing_header: list[str] = []
 
     if file_exists:
         with open(csv_path, "r", newline="") as f:
-            reader = csv.reader(f)
-            existing_header = next(reader, [])
-        # Merge fieldnames: keep existing order, append any new ones at the end
+            reader = csv.DictReader(f)
+            existing_header: list[str] = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+
         new_fields = [k for k in args_dict.keys() if k not in existing_header]
         fieldnames = existing_header + new_fields
-
-        if new_fields:
-            # Header changed: rewrite the whole file with the expanded header
-            with open(csv_path, "r", newline="") as f:
-                rows = list(csv.DictReader(f))
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
     else:
         fieldnames = list(args_dict.keys())
+
+    match_idx = None
+    if is_resume and experiment_name is not None:
+        for i, row in enumerate(existing_rows):
+            if row.get("experiment_name") == experiment_name:
+                match_idx = i
+                break
+        if match_idx is None:
+            print(
+                f"WARNING: is_resume=True but no existing row found for experiment "
+                f"'{experiment_name}' in {csv_path}. Appending a new row instead."
+            )
+
+    if match_idx is not None:
+        existing_rows[match_idx] = {**existing_rows[match_idx], **args_dict}
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in existing_rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+        print(f"Updated existing row for experiment '{experiment_name}' in {csv_path}")
+        return
+
+    if file_exists and existing_header != fieldnames:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in existing_rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+    elif not file_exists:
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
     with open(csv_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writerow(args_dict)
+        writer.writerow({k: args_dict.get(k, "") for k in fieldnames})
 
     print(f"Experiment hyperparameters logged to {csv_path}")
+
+def _create_hparams(args: argparse.Namespace) -> dict:
+    """
+    Creates a dictionary of hyperparameters from the argparse Namespace.
+    """
+    model_hparams = {
+        'encoder_type': args.encoder_type,
+        'input_dim': args.input_dim,
+        'model_dim': args.model_dim,
+        'dim_feedforward': args.feedfoward_dim,
+        'num_heads': args.num_heads,
+        'num_layers': args.num_layers,
+        'dropout': args.dropout,
+        'num_classes': args.num_classes,
+        'pooling_strategy': args.pooling_strategy,
+        'positional_encoding': args.positional_encoding,
+    }
+
+    training_hparams = {
+        'learning_rate': args.learning_rate,
+        'weight_decay': args.weight_decay,
+        'batch_size': args.batch_size,
+        'accumulation_steps': args.accumulation_steps,
+        'warmup_steps': args.warmup_steps,
+        'num_epochs': args.num_epochs,
+        'patience': args.patience,
+        'validate_every': args.validate_every,
+        'use_amp': args.use_amp,
+        'loss_type': args.loss_type,
+        'seed': args.seed,
+    }
+
+    hparams = {**model_hparams, **training_hparams}
+
+    return hparams
+
+def _load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device,
+                    steps_per_epoch=None, total_training_steps=None, warmup_steps=None):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    saved_cfg = checkpoint.get('schedule_config')
+    if saved_cfg is not None:
+        current_cfg = {
+            'steps_per_epoch': steps_per_epoch,
+            'total_training_steps': total_training_steps,
+            'warmup_steps': warmup_steps,
+        }
+        mismatches = {k: (saved_cfg.get(k), v) for k, v in current_cfg.items() if saved_cfg.get(k) != v}
+        if mismatches:
+            raise RuntimeError(
+                f"Schedule config mismatch on resume: {mismatches}. "
+                "num_epochs, accumulation_steps, or dataset/loader size changed since the checkpoint "
+                "was saved — resuming would desync the LR schedule. Fix args to match, or rebuild "
+                "the scheduler from saved_cfg before loading state."
+            )
+
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if checkpoint.get('scaler_state') is not None:
+        scaler.load_state_dict(checkpoint['scaler_state'])
+
+    return {
+        'start_epoch': checkpoint['epoch'] + 1,
+        'best_val_f1': checkpoint.get('best_val_f1', 0.0),
+        'patience_counter': checkpoint.get('patience_counter', 0),
+        'history': checkpoint.get('history', {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': [], 'val_f1': [],
+            'epoch_time': []
+        }),
+    }
+
+
