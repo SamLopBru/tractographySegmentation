@@ -180,7 +180,20 @@ def _get_encoder(encoder_type: str = "transformer",
     else:
         raise ValueError(f"Encoder type must be one of the following options: ['transformer', 'lstm'], got {encoder_type}")
 
-def _check_experiment_name(csv_path: str, experiment_name: str, is_resume: bool = False) -> None:
+def check_resume_consistency(checkpoint_path: str, experiment_name: str, save_dir: str) -> None:
+    """
+    Sanity-checks that a resume checkpoint actually belongs to the experiment
+    being resumed, based on the checkpoint's containing directory.
+    """
+    checkpoint_dir = os.path.basename(os.path.dirname(os.path.abspath(checkpoint_path)))
+    if checkpoint_dir != experiment_name:
+        raise ValueError(
+            f"Checkpoint at '{checkpoint_path}' appears to belong to experiment "
+            f"'{checkpoint_dir}', but --experiment_name is '{experiment_name}'. "
+            "Resuming would mix up experiment logs — fix the mismatch before continuing."
+        )
+
+def check_experiment_name(csv_path: str, experiment_name: str, is_resume: bool = False) -> None:
     """
     Checks if the experiment name already exists in the CSV file.
     Raises a ValueError only for brand-new runs reusing an existing name;
@@ -205,6 +218,30 @@ def _check_experiment_name(csv_path: str, experiment_name: str, is_resume: bool 
             f"Experiment name '{experiment_name}' does not exist in {csv_path}. "
             "Please choose a different name, or ensure the resume checkpoint path is correct."
         )
+
+def _validate_experiment_state(
+    experiment_name: str,
+    csv_path: str,
+    is_resume: bool,
+    checkpoint_path: str | None = None,
+) -> None:
+    """
+    Pre-flight validation before training starts.
+
+    - Fresh run: experiment_name must not already exist in csv_path.
+    - Resumed run: experiment_name must already exist in csv_path, and the
+    checkpoint being resumed must actually belong to that experiment
+    (based on its containing directory name).
+    """
+    check_experiment_name(csv_path, experiment_name, is_resume=is_resume)
+
+    if is_resume:
+        if checkpoint_path is None:
+            raise ValueError(
+                "is_resume=True but no checkpoint_path was provided. "
+                "Pass --resume_checkpoint_path to resume an experiment."
+            )
+        check_resume_consistency(checkpoint_path, experiment_name, save_dir="")
 
 def _parse_args(config):
 
@@ -471,5 +508,3 @@ def _load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, devic
             'epoch_time': []
         }),
     }
-
-

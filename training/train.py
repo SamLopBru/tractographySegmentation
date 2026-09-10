@@ -15,7 +15,7 @@ from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
-from utils.helpers import _check_experiment_name, _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR, _load_checkpoint
+from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR, _load_checkpoint, _validate_experiment_state
 
 
 def train_epoch(model: nn.Module,
@@ -311,7 +311,9 @@ def main():
     config = GlobalConfiguration()
     args = _parse_args(config)
 
-    _check_experiment_name(csv_path=args.experiment_save_dir, experiment_name=args.experiment_name, is_resume=args.resume_checkpoint_path is not None)
+    is_resume=args.resume_checkpoint_path is not None
+
+    _validate_experiment_state(csv_path=args.experiment_save_dir, experiment_name=args.experiment_name, is_resume=is_resume, checkpoint_path=args.resume_checkpoint_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -365,7 +367,7 @@ def main():
             resume_checkpoint_path=args.resume_checkpoint_path
     )
 
-    _log_experiment(args, csv_path=args.experiment_save_dir, history=history)
+    _log_experiment(args, csv_path=args.experiment_save_dir, history=history, is_resume=is_resume)
 
 
 if __name__ == "__main__":
