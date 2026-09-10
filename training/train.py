@@ -10,13 +10,12 @@ import time
 import os
 import sys
 import gc
-import pandas as pd
 
 from losses import _make_loss
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataloader import StratifiedEpochSampler
 from utils.config import GlobalConfiguration
-from utils.helpers import _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR
+from utils.helpers import _check_experiment_name, _get_loader, _get_encoder, _parse_args, _log_experiment, _create_hparams, StepsLR, _load_checkpoint
 
 
 def train_epoch(model: nn.Module,
@@ -60,27 +59,26 @@ def train_epoch(model: nn.Module,
             scaler.unscale_(optimizer)
 
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if torch.isfinite(grad_norm):
+            is_finite = torch.isfinite(grad_norm)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            if is_finite:
                 total_grad_norm += grad_norm.item()
                 grad_norm_count += 1
-
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                
                 scheduler.step()
+
+                with torch.no_grad():
+                    total_loss += loss.detach() * labels.size(0)
+                    predictions = logits.argmax(dim=1)
+                    total_correct += (predictions == labels).sum()
+                    total_samples += labels.size(0)
 
             else:
                 print(f"WARNING: skipping batch {batch_step + 1} due to inf/NaN gradients")
-                optimizer.zero_grad()
-                continue
-
-            with torch.no_grad():
-                total_loss += loss.detach() * labels.size(0)
-                predictions = logits.argmax(dim=1)
-                total_correct += (predictions == labels).sum() # esto lo podría quitar??
-                total_samples += labels.size(0)
-
+            
         if (batch_step + 1) % log_interval == 0:
             avg_loss = total_loss.item() / total_samples
             accuracy = 100.0 * total_correct.item() / total_samples
@@ -153,7 +151,9 @@ def train_loop(model: nn.Module,
             warmup_steps: int,
             validate_every: int,
             hparams: dict,
-            verbose: bool = False,):
+            resume_checkpoint_path: str | None,
+            verbose: bool = False
+        ):
 
     model = model.to(device)
 
@@ -193,13 +193,24 @@ def train_loop(model: nn.Module,
 
     best_val_f1 = 0.0
     patience_counter = 0
+    start_epoch = 0
 
+    if resume_checkpoint_path is not None:
+        state = _load_checkpoint(resume_checkpoint_path, model, optimizer, scheduler, scaler, device, steps_per_epoch, total_training_steps, warmup_steps)
+        start_epoch = state['start_epoch']
+        best_val_f1 = state['best_val_f1']
+        patience_counter = state['patience_counter']
+        history = state['history']
+        if verbose:
+            print(f"Resumed from epoch {start_epoch} (best F1 so far: {best_val_f1:.2f}%)")
+    
     os.makedirs(save_dir, exist_ok=True)
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         
         start_time = time.time()
         train_sampler.set_epoch(epoch)
+        print(f"LR: {scheduler.get_last_lr()}")
 
         train_metrics = train_epoch(model=model, optimizer=optimizer, dataloader=train_loader,
                                     device=device, criterion=criterion, scaler=scaler,
@@ -209,8 +220,8 @@ def train_loop(model: nn.Module,
         if verbose: 
             print(f"\n Train loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
 
-        should_validate = ((epoch % validate_every == 0) or (epoch == num_epochs - 1) and (epoch != 0))
-
+        should_validate = (epoch % validate_every == 0) or ((epoch == num_epochs - 1) and (epoch != 0))
+        
         if should_validate:
             val_sampler.set_epoch(epoch)
 
@@ -250,10 +261,12 @@ def train_loop(model: nn.Module,
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state': scaler.state_dict(),
                 'val_accuracy': val_metrics['accuracy'],
                 'val_macro_f1': best_val_f1,
                 'history': history,
-                'params': hparams
+                'hparams': hparams
             }
 
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
@@ -276,7 +289,8 @@ def train_loop(model: nn.Module,
             'scaler_state': scaler.state_dict() if scaler is not None else None,
             'best_val_f1': best_val_f1,
             'patience_counter': patience_counter,
-            'history': history
+            'history': history,
+            'hparams': hparams
         }, os.path.join(save_dir, 'latest_checkpoint.pt'))
 
         gc.collect()
@@ -296,6 +310,8 @@ def main():
 
     config = GlobalConfiguration()
     args = _parse_args(config)
+
+    _check_experiment_name(csv_path=args.experiment_save_dir, experiment_name=args.experiment_name, is_resume=args.resume_checkpoint_path is not None)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -328,7 +344,7 @@ def main():
                             seed=args.seed,
                             verbose=args.verbose)
 
-    train_loop(model=model,
+    history = train_loop(model=model,
             criterion=criterion,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -345,10 +361,11 @@ def main():
             save_dir=os.path.join(args.save_dir,args.experiment_name),
             validate_every=args.validate_every,
             verbose=args.verbose,
-            hparams=_create_hparams(args)
-            )
+            hparams=_create_hparams(args),
+            resume_checkpoint_path=args.resume_checkpoint_path
+    )
 
-    _log_experiment(args, csv_path=args.experiment_save_dir)
+    _log_experiment(args, csv_path=args.experiment_save_dir, history=history)
 
 
 if __name__ == "__main__":
