@@ -26,7 +26,7 @@ class GlobalConfiguration:
     # Training hyperparameters
     # use_amp: bool = True
     batch_size: int = 1024
-    learning_rate: float = 0.1
+    learning_rate: float = 1e-4
     weight_decay: float = 0.05
     num_epochs: int = 40
     patience: int = 10
