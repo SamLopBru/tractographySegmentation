@@ -11,7 +11,7 @@ from torch import Value, nn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-from training.encoder import TransformerEncoder, LSTMEncoder, GRUEncoder
+from architectures.encoder import TransformerEncoder, LSTMEncoder, GRUEncoder
 from utils.config import GlobalConfiguration
 from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
 
@@ -36,7 +36,7 @@ def extract_best_values_history(history: dict) -> dict:
     }
     return best_values
 
-def _get_stratified_epoch_sampler(train_dataset: StreamlineDataset,
+def get_stratified_epoch_sampler(train_dataset: StreamlineDataset,
                                 val_dataset: StreamlineDataset,
                                 sampling_percentage_train: float,
                                 sampling_percentage_val: float,
@@ -71,7 +71,7 @@ def _get_loader(train_dir: str,
                 max_streamlines: Optional[int],
                 min_streamlines: int,
                 seed: int,
-                verbose: bool
+                verbose: bool,
                 ) -> tuple[DataLoader, DataLoader, StratifiedEpochSampler, StratifiedEpochSampler]:
     """
     Returns the train and validation data loaders.
@@ -94,7 +94,7 @@ def _get_loader(train_dir: str,
                                     seed=seed, 
                                     verbose=verbose)
 
-    train_sampler, val_sampler = _get_stratified_epoch_sampler(train_dataset=train_dataset,
+    train_sampler, val_sampler = get_stratified_epoch_sampler(train_dataset=train_dataset,
                                                                 val_dataset=val_dataset,
                                                                 sampling_percentage_train=sampling_percentage_train,
                                                                 sampling_percentage_val=sampling_percentage_val,
@@ -131,6 +131,47 @@ def _get_loader(train_dir: str,
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
+
+def _get_test_loader(test_dir: str,
+                    batch_size: int,
+                    num_workers: int,
+                    sampling_percentage_test: float,
+                    max_streamlines: Optional[int],
+                    min_streamlines: int,
+                    seed: int,
+                    verbose: bool,
+                    ) -> DataLoader:
+    """
+    Returns the test data loader.
+
+    Unlike train/val, the test loader does not use a StratifiedEpochSampler:
+    evaluation should see the (sub)sampled streamlines in a fixed, sequential
+    order so predictions can be traced back to their patient/bundle without
+    class-balancing distortion.
+    """
+
+    hdf5_test_paths = [os.path.join(test_dir, f) for f in os.listdir(test_dir)]
+
+    test_dataset = StreamlineDataset(hdf5_test_paths,
+                                    sampling_percentage=sampling_percentage_test,
+                                    min_streamlines=min_streamlines,
+                                    max_streamlines=max_streamlines,
+                                    seed=seed,
+                                    verbose=verbose)
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=None,  
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=streamline_collate_fn,
+        persistent_workers=False,
+    )
+
+    return test_loader
 
 def _get_encoder(encoder_type: str = "transformer",
                 input_dim: int = 5,
@@ -243,9 +284,10 @@ def _validate_experiment_state(
             )
         check_resume_consistency(checkpoint_path, experiment_name, save_dir="")
 
-def _parse_args(config):
+def _parse_args(config=None):
 
-    config = GlobalConfiguration()
+    if config is None:
+        config = GlobalConfiguration()
 
     parser = argparse.ArgumentParser(description="Streamline classification training arguments.")
 
@@ -255,7 +297,7 @@ def _parse_args(config):
     parser.add_argument('--save_dir', type=str, default="checkpoints",
                         help="Directory to save the model checkpoints and logs. If not provided, defaults to './experiments/{experiment_name}'")
 
-    parser.add_argument("--experiment_save_dir", type=str, default="results/training_experiments.csv",
+    parser.add_argument("--experiment_save_dir", type=str, default="results/training/training_experiments.csv",
                         help="Directory to save the model arguments used for the experiment.")
 
     parser.add_argument('--experiment_description', type=str, default=None,
@@ -353,6 +395,48 @@ def _parse_args(config):
 
     parser.add_argument('--resume_checkpoint_path', type=str, default=None,
                         help="Path to the checkpoint for resuming training")
+
+    return parser.parse_args()
+
+def _parse_test_args(config=None):
+
+    if config is None:
+        config = GlobalConfiguration()
+
+    parser = argparse.ArgumentParser(description="Streamline classification testing arguments.")
+
+    parser.add_argument('--model_path', type=str, required=True,
+                        help="Path to the trained model checkpoint")
+
+    parser.add_argument('--output_path', type=str,
+                        help="Directory to save the test results")
+
+    parser.add_argument('--testLoader_path', type=str, default=config.testLoader_path,
+                        help="Directory path of the test data")
+
+    parser.add_argument('--batch_size', type=int, default=config.batch_size,
+                        help="Batch size for testing")
+
+    parser.add_argument('--num_workers', type=int, default=config.num_workers,
+                        help="Number of workers for the test dataloader")
+
+    parser.add_argument('--sampling_percentage_test', type=float, default=config.sampling_percentage_test,
+                        help="Percentage of streamlines to sample from the test dataset")
+
+    parser.add_argument('--min_streamlines', type=int, default=config.min_streamlines,
+                        help="Minimum number of streamlines per tract")
+
+    parser.add_argument('--max_streamlines', type=int, default=config.max_streamlines,
+                        help="Maximum number of streamlines per tract")
+
+    parser.add_argument('--num_classes', type=int, default=config.num_classes,
+                        help="Number of classes to predict")
+
+    parser.add_argument('--seed', type=int, default=config.seed,
+                        help="Random seed for reproducibility")
+
+    parser.add_argument('--verbose', action='store_true',
+                        help="Activates verbose mode for detailed logging")
 
     return parser.parse_args()
 
