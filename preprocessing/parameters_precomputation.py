@@ -94,11 +94,11 @@ def main(scope: str, verbose: bool = False,
     
     if verbose:
         print(f"\nSaved results for {len(results)} subjects to {output_file}")
-        print(f"\nTotal time: {end_time - start_time:.2f} seconds") # This can be deleted
+        print(f"\nTotal time: {end_time - start_time:.2f} seconds") # This can be deleted 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Compute normalization parameters for streamlines')
-    parser.add_argument('--scope', type=str, default='testset', help='Scope of the dataset')
+    parser.add_argument('--scope', type=str, default='testset', help='Scope of the dataset.')
     parser.add_argument('--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('--output', type=str, default=None, help='Output CSV file path')
     parser.add_argument('--dataset_path', type=str, default="/home/blancolote/TFM/Tractoinferno/ds003900-download/derivatives", help='Path to the dataset')

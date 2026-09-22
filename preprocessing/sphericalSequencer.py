@@ -233,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_path', type=str, default='/home/blancolote/TFM/Tractoinferno/ds003900-download/derivatives', help='Path to the dataset')
     parser.add_argument('--csv_path', type=str, default=None, help='Path to the CSV file with normalization parameters')
     parser.add_argument('--output_dir', type=str, default='sequences', help='Path to the output directory')
-    parser.add_argument('--max_workers', type=int, default=27, help='Maximum number of worker processes to use')
+    parser.add_argument('--max_workers', type=int, default=24, help='Maximum number of worker processes to use')
     args = parser.parse_args()
     main(args.scope, args.dataset_path, args.csv_path, args.output_dir, args.max_workers)
     print(f"Total processing time: {time.time() - start_time:.2f} seconds")
