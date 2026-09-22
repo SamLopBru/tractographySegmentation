@@ -1,3 +1,5 @@
+from concurrent.futures import process
+
 import torch
 import torch.nn as nn
 import json
@@ -9,7 +11,7 @@ import torchmetrics
 import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-from utils.helpers import _get_test_loader, _parse_test_args
+from utils.helpers import _get_test_loader, _parse_test_args, _load_model
 
 
 # def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
@@ -18,6 +20,7 @@ from utils.helpers import _get_test_loader, _parse_test_args
 #     precision = precision_score(y_true, y_pred, average='macro')
 #     recall = recall_score(y_true, y_pred, average='macro')
 #     return f1, acc, precision, recall
+
 
 @torch.no_grad()
 def test_loop(model: nn.Module, dataloader: torch.utils.data.DataLoader, device: torch.device, num_classes: int, output_path: str):
@@ -35,7 +38,7 @@ def test_loop(model: nn.Module, dataloader: torch.utils.data.DataLoader, device:
         prefix="test_"
     ).to(device)
 
-    confmat = torchmetrics.ConfusionMatrix(task="multiclass", num_classes=num_classes, prefix="test_").to(device)
+    confmat = torchmetrics.ConfusionMatrix(task="multiclass", num_classes=num_classes).to(device)
 
     for streamlines, lengths, labels in dataloader:
 
@@ -95,7 +98,7 @@ def main():
     # Load the model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = torch.load(args.model_path)
+    model = _load_model(args.model_path)
     model.to(device)
 
     # Run the test loop
