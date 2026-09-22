@@ -284,7 +284,7 @@ def _validate_experiment_state(
             )
         check_resume_consistency(checkpoint_path, experiment_name, save_dir="")
 
-def _parse_args(config=None):
+def _parse_args(config=None) -> argparse.Namespace:
 
     if config is None:
         config = GlobalConfiguration()
@@ -398,7 +398,7 @@ def _parse_args(config=None):
 
     return parser.parse_args()
 
-def _parse_test_args(config=None):
+def _parse_test_args(config=None) -> argparse.Namespace:
 
     if config is None:
         config = GlobalConfiguration()
@@ -570,7 +570,7 @@ def _create_hparams(args: argparse.Namespace, scaled_learning_rate: float, effec
     return hparams
 
 def _load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device,
-                    steps_per_epoch=None, total_training_steps=None, warmup_steps=None):
+                    steps_per_epoch=None, total_training_steps=None, warmup_steps=None) -> dict:
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -606,3 +606,29 @@ def _load_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, devic
             'epoch_time': []
         }),
     }
+
+def _load_model(model_path: str) -> nn.Module:
+
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    hparams = state_dict["hparams"]
+
+    encoder = _get_encoder(
+        encoder_type=hparams["encoder_type"],
+        input_dim=hparams["input_dim"],
+        model_dim=hparams["model_dim"],
+        dim_feedforward=hparams["dim_feedforward"],
+        num_heads=hparams["num_heads"],
+        num_layers=hparams["num_layers"],
+        dropout=hparams["dropout"],
+        num_classes=hparams["num_classes"],
+        pooling_strategy=hparams["pooling_strategy"],
+        positional_encoding=hparams["positional_encoding"]
+    )
+
+    result = encoder.load_state_dict(state_dict["model_state_dict"])
+
+    # Checks to capture unexpected missmatches between the model architecture and the checkpoint.
+    if result.missing_keys or result.unexpected_keys:
+        print(f"Warning: missing_keys={result.missing_keys}, unexpected_keys={result.unexpected_keys}")
+
+    return encoder
