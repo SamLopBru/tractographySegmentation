@@ -1,18 +1,19 @@
 import pathlib
-import nibabel as nib
+import sys
+import os
+import time
+import argparse
+import pandas as pd
 import numpy as np
+
+import nibabel as nib
+from nibabel import affines
 from dipy.io.streamline import load_tractogram
 from dipy.io.stateful_tractogram import StatefulTractogram
 from scipy.ndimage import center_of_mass
-import sys
-import os
-import pandas as pd
-import time
-import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-
 from utils.dataset_handler import Tractoinferno_handler
 
 def compute_com(mri: nib.Nifti1Image) -> np.ndarray:
@@ -31,7 +32,7 @@ def compute_com(mri: nib.Nifti1Image) -> np.ndarray:
         raise ValueError("Could not compute center of mass: empty or invalid mask.")
 
     # Convert to RAS space using the affine transformation
-    com_ras = np.dot(affine, np.append(com_vox, 1))[:3] 
+    com_ras = affines.apply_affine(affine, com_vox)
         
     return com_ras
 
