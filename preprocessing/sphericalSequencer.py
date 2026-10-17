@@ -63,11 +63,15 @@ class SphericalSequencer:
 
         r = np.linalg.norm(centered, axis=1)
         r_norm = (r - r_min) / (r_max - r_min + epsilon)
-        theta = np.arccos(np.clip(centered[:, 2] / (r + epsilon), -1, 1))
+
+        # Instead of using np.arccos and np.sin, we can compute sin(theta) directly from cos(theta) for better performance
+        cos_theta = np.clip(centered[:, 2] / (r + epsilon), -1, 1) 
+        sin_theta = np.sqrt(1.0 - cos_theta**2)
+
         phi = np.arctan2(centered[:, 1], centered[:, 0])
 
         features = np.stack(
-            (r_norm, np.cos(theta), np.sin(theta), np.cos(phi), np.sin(phi)),
+            (r_norm, cos_theta, sin_theta, np.cos(phi), np.sin(phi)),
             axis=1,
         ).astype(np.float32)
 
