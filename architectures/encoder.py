@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoderLayer, LSTM, GRU
 from torch.nn.utils.rnn import pack_padded_sequence
-from positional_encoders import SinusoidalPositionalEncoding
+from .positional_encoders import SinusoidalPositionalEncoding
 
 
 class ClassifierHead(nn.Module):
@@ -149,7 +149,8 @@ class TransformerEncoder(nn.Module):
             x_pooled = x[:, 0]
         elif self.pooling_strategy == "mean":
             mask = ~padding_mask.unsqueeze(-1) # (B, max_seq_len, 1)
-            x_pooled = x.sum(dim=1) / mask.sum(dim=1).clamp(min=1) # clamp to avoid dividing by 0
+            x_masked = x * mask
+            x_pooled = x_masked.sum(dim=1) / mask.sum(dim=1).clamp(min=1) # clamp to avoid dividing by 0
         elif self.pooling_strategy == "max":
             x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf')) # (B, max_seq_len, 1)
             x_pooled = x.max(dim=1)[0].clamp(min=-1e9)
