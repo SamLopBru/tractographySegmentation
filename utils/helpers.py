@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from architectures.encoder import TransformerEncoder, LSTMEncoder, GRUEncoder
 from utils.config import GlobalConfiguration
-from utils.dataloader import StratifiedEpochSampler, StreamlineDataset, streamline_collate_fn
+from utils.dataloader_optimized import StratifiedEpochSampler, StreamlineDataset, make_dataloader, StreamlineBatchSampler
 
 
 class StepsLR(Protocol):
@@ -61,8 +61,8 @@ def get_stratified_epoch_sampler(train_dataset: StreamlineDataset,
 
     return train_sampler, val_sampler
 
-def _get_loader(train_dir: str, 
-                val_dir:str,
+def _get_loader(train_dir: str,
+                val_dir: str,
                 batch_size: int,
                 num_workers: int,
                 shuffle: bool,
@@ -72,65 +72,56 @@ def _get_loader(train_dir: str,
                 min_streamlines: int,
                 seed: int,
                 verbose: bool,
-                ) -> tuple[DataLoader, DataLoader, StratifiedEpochSampler, StratifiedEpochSampler]:
+                cache_dir: Optional[str] = "cache_streamlines",
+                bucket_by_length: bool = True,
+                ) -> tuple[DataLoader, DataLoader, StreamlineBatchSampler, StreamlineBatchSampler]:
     """
-    Returns the train and validation data loaders.
+    Returns the train and validation data loaders plus their samplers.
+    The returned "samplers" are batch samplers: call .set_epoch(epoch) on them as before.
     """
+    def _list_hdf5(d: str) -> list[str]:
+        # sorted + only .hdf5: deterministic file order (stable cache key) and no leftover .tmp files
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".hdf5"))
 
-    hdf5_train_paths = [os.path.join(train_dir, f) for f in os.listdir(train_dir)]
-    hdf5_val_paths = [os.path.join(val_dir, f) for f in os.listdir(val_dir)]
-
-    train_dataset = StreamlineDataset(hdf5_train_paths, 
+    train_dataset = StreamlineDataset(_list_hdf5(train_dir),
                                     sampling_percentage=sampling_percentage_train,
                                     min_streamlines=min_streamlines,
                                     max_streamlines=max_streamlines,
                                     seed=seed,
-                                    verbose=verbose)
-    
-    val_dataset = StreamlineDataset(hdf5_val_paths, 
-                                    sampling_percentage=sampling_percentage_val, 
-                                    min_streamlines=min_streamlines, 
-                                    max_streamlines=max_streamlines, 
-                                    seed=seed, 
-                                    verbose=verbose)
+                                    verbose=verbose,
+                                    cache_dir=cache_dir)
+
+    val_dataset = StreamlineDataset(_list_hdf5(val_dir),
+                                    sampling_percentage=sampling_percentage_val,
+                                    min_streamlines=min_streamlines,
+                                    max_streamlines=max_streamlines,
+                                    seed=seed,
+                                    verbose=verbose,
+                                    cache_dir=cache_dir)
 
     train_sampler, val_sampler = get_stratified_epoch_sampler(train_dataset=train_dataset,
-                                                                val_dataset=val_dataset,
-                                                                sampling_percentage_train=sampling_percentage_train,
-                                                                sampling_percentage_val=sampling_percentage_val,
-                                                                min_samples_per_class=min_streamlines,
-                                                                seed=seed,
-                                                                shuffle=shuffle,
-                                                                verbose=verbose
-                                                            )
+                                                            val_dataset=val_dataset,
+                                                            sampling_percentage_train=sampling_percentage_train,
+                                                            sampling_percentage_val=sampling_percentage_val,
+                                                            min_samples_per_class=min_streamlines,
+                                                            seed=seed,
+                                                            shuffle=shuffle,
+                                                            verbose=verbose)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=streamline_collate_fn,
-        persistent_workers=False,
-        # prefetch_factor=2 SERÁ NECESARIO?
+    train_loader, train_batch_sampler = make_dataloader(
+        train_dataset, train_sampler,
+        batch_size=batch_size, num_workers=num_workers,
+        bucket_by_length=bucket_by_length, drop_last=True,
+        pin_memory=True, seed=seed,
+    )
+    val_loader, val_batch_sampler = make_dataloader(
+        val_dataset, val_sampler,
+        batch_size=batch_size, num_workers=num_workers,
+        bucket_by_length=bucket_by_length, drop_last=False,
+        pin_memory=True, seed=seed,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=streamline_collate_fn,
-        persistent_workers=False,
-        # prefetch_factor=2 SERÁ NECESARIO?
-    )
-
-    return train_loader, val_loader, train_sampler, val_sampler
+    return train_loader, val_loader, train_batch_sampler, val_batch_sampler
 
 def _get_test_loader(test_dir: str,
                     batch_size: int,
@@ -323,6 +314,12 @@ def _parse_args(config=None) -> argparse.Namespace:
 
     parser.add_argument('--num_classes', type=int, default=config.num_classes,
                         help="Number of classes to predict")
+
+    parser.add_argument("--cache_dir", type=str, default=config.cache_dir,
+                        help="Directory to cache the streamline data for faster loading. If not provided, defaults to './cache_streamlines'")
+    
+    parser.add_argument("--bucket_by_length", action=argparse.BooleanOptionalAction, default=config.bucket_by_length,
+                        help="Whether to bucket streamlines by length for more efficient batching. Default is True.")
 
     parser.add_argument('--model_dim', type=int, default=config.model_dim,
                         help="Dimension of the model embeddings")
